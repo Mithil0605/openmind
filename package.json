@@ -1,0 +1,40 @@
+{
+  "name": "opencode-memory-extension",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Cross-platform OpenCode plugin that gives agents persistent memory tools.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "install.mjs",
+    "install.sh",
+    "install.ps1",
+    "install.cmd",
+    "README.md",
+    "SETUP.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --check index.js && node test/smoke.mjs",
+    "pack:local": "npm pack",
+    "setup": "node install.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "persistent-memory",
+    "windows",
+    "linux"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.15.13"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
