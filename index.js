@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { homedir, platform } from "node:os";
@@ -29,7 +29,7 @@ function asArray(value) {
 }
 
 function normalizeScope(scope) {
-  if (scope === "global" || scope === "session") return scope;
+  if (scope === "global") return scope;
   return "project";
 }
 
@@ -63,7 +63,7 @@ async function readMemories(file) {
         return null;
       }
     })
-    .filter((item) => item && item.deleted !== true);
+    .filter((item) => item && item.deleted !== true && item.scope !== "session");
 }
 
 async function appendMemory(file, memory) {
@@ -73,6 +73,10 @@ async function appendMemory(file, memory) {
 }
 
 async function replaceMemories(file, memories) {
+  if (memories.length === 0) {
+    await rm(file, { force: true });
+    return;
+  }
   await mkdir(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   const body = memories.map((memory) => JSON.stringify(memory)).join("\n");
@@ -82,8 +86,20 @@ async function replaceMemories(file, memories) {
 
 function visibleTo(memory, context) {
   if (memory.scope === "global") return true;
-  if (memory.scope === "session") return memory.sessionID === context.sessionID;
   return memory.project === projectKey(context);
+}
+
+async function removeLegacySessionData(file) {
+  if (!existsSync(file)) return;
+  const raw = await readFile(file, "utf8");
+  const entries = raw
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try { return JSON.parse(line); } catch { return null; }
+    })
+    .filter((item) => item && item.deleted !== true && item.scope !== "session");
+  await replaceMemories(file, entries);
 }
 
 function scoreMemory(memory, query, tags) {
@@ -131,7 +147,7 @@ function formatMemory(memory) {
 function memoryBlock(memories) {
   if (memories.length === 0) return "";
   return [
-    "Persistent memory:",
+    "OpenMind saved preferences:",
     ...memories.map((memory) => {
       const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
       return `- ${memory.text}${tags}`;
@@ -141,17 +157,19 @@ function memoryBlock(memories) {
 
 export const MemoryPlugin = async (_input, options = {}) => {
   const file = storagePath(options);
+  // One-time v2 migration: erase formerly persisted session-only entries.
+  await removeLegacySessionData(file);
   const autoInject = options.autoInject !== false;
   const injectLimit = Math.max(1, Math.min(Number(options.injectLimit || 8), 25));
 
   return {
     tool: {
       memory_remember: tool({
-        description: "Save a durable memory for future OpenCode sessions. Use for stable user preferences, project facts, decisions, reusable commands, and recurring constraints.",
+        description: "Explicitly save a durable OpenMind preference or project fact. Never use this for conversational/session details; sessions are not saved by OpenMind v2.",
         args: {
           text: tool.schema.string().min(1).max(MAX_TEXT_LENGTH).describe("The fact, preference, decision, or instruction to remember."),
           tags: tool.schema.array(tool.schema.string()).optional().describe("Optional tags for later recall."),
-          scope: tool.schema.enum(["project", "global", "session"]).optional().describe("project is default, global applies everywhere, session only applies to the current session."),
+          scope: tool.schema.enum(["project", "global"]).optional().describe("project is default; global applies everywhere. Session saving is intentionally unavailable."),
           source: tool.schema.string().optional().describe("Optional source or reason for this memory."),
           pinned: tool.schema.boolean().optional().describe("Pinned memories are shown first during recall and auto injection."),
         },
@@ -166,7 +184,6 @@ export const MemoryPlugin = async (_input, options = {}) => {
             source: args.source?.trim() || null,
             pinned: Boolean(args.pinned),
             project: scope === "project" ? projectKey(context) : null,
-            sessionID: scope === "session" ? context.sessionID : null,
             createdAt: timestamp,
             updatedAt: timestamp,
           };
@@ -181,7 +198,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
       }),
 
       memory_recall: tool({
-        description: "Search persistent memories visible to this project/session.",
+        description: "Search saved OpenMind preferences visible to this project.",
         args: {
           query: tool.schema.string().optional().describe("Search text."),
           tags: tool.schema.array(tool.schema.string()).optional().describe("Only prefer memories matching these tags."),
@@ -196,7 +213,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
       }),
 
       memory_list: tool({
-        description: "List recent persistent memories visible to this project/session.",
+        description: "List recent saved OpenMind preferences visible to this project.",
         args: {
           limit: tool.schema.number().int().min(1).max(50).optional().describe("Maximum memories to return."),
         },
@@ -213,7 +230,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
       }),
 
       memory_forget: tool({
-        description: "Delete a persistent memory by id.",
+        description: "Permanently delete one saved memory by id. If it is the last item, its backing store is removed too.",
         args: {
           id: tool.schema.string().min(1).describe("The memory id to delete."),
         },
@@ -231,10 +248,51 @@ export const MemoryPlugin = async (_input, options = {}) => {
         },
       }),
 
+      memory_prune: tool({
+        description: "Permanently delete saved memories the user no longer wants or needs. Match by IDs, exact text search, or tags. A deletion preview is returned unless confirm is true.",
+        args: {
+          ids: tool.schema.array(tool.schema.string()).optional().describe("Memory IDs to delete."),
+          query: tool.schema.string().optional().describe("Case-insensitive text to match."),
+          tags: tool.schema.array(tool.schema.string()).optional().describe("Delete memories having any of these tags."),
+          confirm: tool.schema.boolean().optional().describe("Set true only after the user has approved the matching deletion."),
+        },
+        async execute(args, context) {
+          const ids = new Set(asArray(args.ids));
+          const query = String(args.query || "").trim().toLowerCase();
+          const tags = asArray(args.tags).map((tag) => tag.toLowerCase());
+          if (ids.size === 0 && !query && tags.length === 0) return "Choose at least one id, query, or tag before deleting memories.";
+          const memories = await readMemories(file);
+          const matches = memories.filter((memory) => {
+            if (!visibleTo(memory, context)) return false;
+            if (ids.has(memory.id)) return true;
+            if (query && [memory.text, memory.source, ...(memory.tags || [])].filter(Boolean).join(" ").toLowerCase().includes(query)) return true;
+            return tags.some((tag) => (memory.tags || []).some((memoryTag) => memoryTag.toLowerCase() === tag));
+          });
+          if (matches.length === 0) return "No visible memories match that deletion request.";
+          if (args.confirm !== true) return { title: "Deletion preview", output: `Set confirm: true to permanently delete ${matches.length} memory item(s).\n${matches.map(formatMemory).join("\n")}`, metadata: { count: matches.length } };
+          const matchedIDs = new Set(matches.map((memory) => memory.id));
+          await replaceMemories(file, memories.filter((memory) => !matchedIDs.has(memory.id)));
+          return { title: "Memories deleted", output: `Permanently deleted ${matches.length} memory item(s).`, metadata: { count: matches.length, file } };
+        },
+      }),
+
+      memory_delete_store: tool({
+        description: "Permanently delete every OpenMind saved memory and remove the on-disk storage file. Requires explicit confirmation.",
+        args: {
+          confirm: tool.schema.boolean().optional().describe("Set true only when the user explicitly requests deletion of all OpenMind memory."),
+        },
+        async execute(args) {
+          if (args.confirm !== true) return "This permanently removes all OpenMind memory and its storage file. Set confirm: true only after the user explicitly approves it.";
+          const count = (await readMemories(file)).length;
+          await rm(file, { force: true });
+          return { title: "OpenMind storage deleted", output: `Deleted ${count} saved memory item(s) and removed the OpenMind storage file.`, metadata: { count, file } };
+        },
+      }),
+
       memory_export: tool({
         description: "Show the memory store location and export visible memories as JSON.",
         args: {
-          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default; all includes memories outside this project/session."),
+          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default; all includes memories from other projects."),
         },
         async execute(args, context) {
           const memories = await readMemories(file);

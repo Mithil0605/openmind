@@ -1,8 +1,8 @@
 {
-  "name": "opencode-memory-extension",
-  "version": "0.1.0",
+  "name": "openmind-v2",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Cross-platform OpenCode plugin that gives agents persistent memory tools.",
+  "description": "Privacy-first, user-controlled memory tools for OpenCode with no session persistence.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
@@ -25,8 +25,8 @@
   "keywords": [
     "opencode",
     "plugin",
-    "memory",
-    "persistent-memory",
+    "openmind",
+    "privacy",
     "windows",
     "linux"
   ],

@@ -1,8 +1,8 @@
-# OpenCode Memory Extension
+# OpenMind v2
 
-Cross-platform persistent memory tools for OpenCode on Windows, Linux, and macOS.
+Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS.
 
-The plugin stores memories in a local JSONL file and exposes tools the agent can call when you say things like "remember this", "what do you remember about this project?", or "forget memory `<id>`".
+OpenMind never saves sessions. Durable memory is opt-in and is limited to explicit project or global preferences. Users can permanently delete one item, matching unwanted items, or the entire backing store.
 
 ## Easiest Install
 
@@ -23,7 +23,7 @@ Then restart OpenCode.
 After publishing this package to npm:
 
 ```bash
-opencode plugin opencode-memory-extension --global
+opencode plugin openmind-v2 --global
 ```
 
 Restart OpenCode after installation.
@@ -80,17 +80,20 @@ Windows example:
 
 ## Tools
 
-- `memory_remember`: save a memory
+- `memory_remember`: explicitly save a project or global memory
 - `memory_recall`: search memories
 - `memory_list`: list recent memories
-- `memory_forget`: delete a memory by id
+- `memory_forget`: permanently delete a memory by id
+- `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
+- `memory_delete_store`: permanently delete all memories and remove the storage file
 - `memory_export`: show/export stored memories
 
 ## Scopes
 
 - `project`: default; visible only in the current worktree
 - `global`: visible in every OpenCode project
-- `session`: visible only in the current session
+
+There is deliberately no `session` scope. During its first v2 load, OpenMind removes any session records created by earlier versions.
 
 ## Storage
 
@@ -137,6 +140,8 @@ Remember globally that I prefer concise final answers.
 Remember for this project that tests should be run with npm test.
 What do you remember about this project?
 Forget memory 4dbf8c53-...
+Delete all memories tagged temporary.
+Delete all OpenMind memory and its storage file.
 ```
 
 ## Development

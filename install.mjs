@@ -33,8 +33,8 @@ function versionNumber(text) {
   return match ? match.slice(1).map(Number) : null;
 }
 
-console.log("OpenCode Memory Extension setup");
-console.log("=================================");
+console.log("OpenMind v2 setup");
+console.log("=================");
 
 const nodeVersion = versionNumber(process.version);
 if (!nodeVersion || nodeVersion[0] < 22) {
@@ -49,7 +49,7 @@ if (opencodeCheck.status !== 0) {
 console.log("OK OpenCode " + String(opencodeCheck.stdout || opencodeCheck.stderr).trim());
 
 if (!existsSync(resolve(root, "package.json"))) {
-  fail("package.json was not found. Run setup from the extracted opencode-memory-extension folder.");
+  fail("package.json was not found. Run setup from the extracted openmind-v2 folder.");
 }
 
 console.log("Installing plugin dependencies...");
@@ -64,4 +64,5 @@ console.log("\nSetup complete.");
 console.log("Restart OpenCode, then try:");
 console.log("  Remember globally that I prefer short answers.");
 console.log("  What do you remember about me?");
-console.log("\nMemory file location can be changed later with OPENCODE_MEMORY_DIR.");
+console.log("\nOpenMind v2 does not save session data. Durable memory is opt-in and can be deleted at any time.");
+console.log("Memory file location can be changed later with OPENCODE_MEMORY_DIR.");
