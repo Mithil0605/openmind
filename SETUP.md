@@ -33,15 +33,19 @@ Then restart OpenCode.
 In OpenCode, type:
 
 ```text
-Remember globally that I prefer short answers.
-What do you remember about me?
+Remember for this project that I prefer short answers.
+What do you remember about this project?
 ```
 
 ## Privacy and Deletion
 
-OpenMind v2 does not save session conversations. It stores only memories that are explicitly saved as project or global preferences.
+OpenMind v2 does not save session conversations. It stores only memories that are explicitly saved as project preferences.
 
 Ask OpenCode to delete a specific memory, delete memories matching a tag or phrase, or delete all OpenMind memory and its storage file. Matching deletions are previewed before permanent removal.
+
+## Optional Encryption
+
+By default the store is plaintext. Ask OpenCode to "unlock the memory store with my password" to encrypt it. The password is verified like sudo with a 5-attempt rate limit, then the store is AES-256-GCM encrypted on disk.
 
 ## Where Explicitly Saved Memories Are Stored
 

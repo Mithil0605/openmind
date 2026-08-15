@@ -62,7 +62,7 @@ if (register.status !== 0) fail("OpenCode plugin registration failed. Check the 
 
 console.log("\nSetup complete.");
 console.log("Restart OpenCode, then try:");
-console.log("  Remember globally that I prefer short answers.");
-console.log("  What do you remember about me?");
-console.log("\nOpenMind v2 does not save session data. Durable memory is opt-in and can be deleted at any time.");
+console.log("  Remember for this project that I prefer short answers.");
+console.log("  What do you remember about this project?");
+console.log("\nOpenMind v2 does not save session data. Durable memory is opt-in, project-scoped, and can be deleted at any time.");
 console.log("Memory file location can be changed later with OPENCODE_MEMORY_DIR.");

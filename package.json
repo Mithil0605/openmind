@@ -1,8 +1,8 @@
 {
   "name": "openmind-v2",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "description": "Privacy-first, user-controlled memory tools for OpenCode with no session persistence.",
+  "description": "Privacy-first, user-controlled memory tools for OpenCode with optional AES-256-GCM encryption, no session persistence, and atomic writes.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
@@ -18,7 +18,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --check index.js && node test/smoke.mjs",
+    "test": "node --check index.js && node test/smoke.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs",
     "pack:local": "npm pack",
     "setup": "node install.mjs"
   },

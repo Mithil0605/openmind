@@ -1,5 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import plugin from "../index.js";
 
@@ -34,7 +34,7 @@ try {
 
   const output = { system: [] };
   await hooks["experimental.chat.system.transform"]({ sessionID: "smoke-session", model: {} }, output);
-  if (!output.system.join("\n").includes("OpenMind saved preferences:")) throw new Error("memory block was not injected");
+  if (!output.system.join("\n").includes("OpenMind saved preferences")) throw new Error("memory block was not injected");
 
   const exported = await hooks.tool.memory_export.execute({ scope: "visible" }, context);
   if (!String(exported.output).includes("portable OpenCode plugin")) throw new Error("memory_export did not include saved memory");
@@ -43,10 +43,28 @@ try {
   const raw = await readFile(file, "utf8");
   if (!raw.includes("portable OpenCode plugin")) throw new Error("memory file was not written");
 
+  const env = { env: {} };
+  await hooks["shell.env"]({ cwd: directory }, env);
+  if (env.env.OPENCODE_MEMORY_PROJECT !== directory) throw new Error("shell.env did not emit the correct project key");
+  if (!env.env.OPENCODE_MEMORY_FILE) throw new Error("shell.env did not emit the memory file path");
+
+  const globalAttempt = await hooks.tool.memory_remember.execute(
+    { text: "Global-only preference should become a project memory", tags: ["smoke", "scope"], scope: "global" },
+    context,
+  );
+  if (!String(globalAttempt.output).includes("(project")) throw new Error("global scope was not stored as project scope");
+
+  const otherDirectory = join(dirname(directory), "opencode-memory-other-worktree");
+  await mkdir(otherDirectory, { recursive: true });
+  const otherContext = { ...context, directory: otherDirectory, worktree: otherDirectory };
+  const crossList = await hooks.tool.memory_list.execute({}, otherContext);
+  if (!String(crossList).includes("No memories")) throw new Error("project memory leaked into another worktree");
+  await rm(otherDirectory, { recursive: true, force: true });
+
   const preview = await hooks.tool.memory_prune.execute({ tags: ["smoke"] }, context);
   if (preview.title !== "Deletion preview") throw new Error("memory_prune did not return a deletion preview");
   const pruned = await hooks.tool.memory_prune.execute({ tags: ["smoke"], confirm: true }, context);
-  if (pruned.metadata?.count !== 1) throw new Error("memory_prune did not delete matching memory");
+  if (pruned.metadata?.count !== 2) throw new Error("memory_prune did not delete matching memories");
   try {
     await readFile(file, "utf8");
     throw new Error("empty memory store was not removed");
