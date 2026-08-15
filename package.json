@@ -1,6 +1,6 @@
 {
-  "name": "openmind-v2",
-  "version": "2.1.0",
+  "name": "openmind-v3",
+  "version": "3.0.0",
   "type": "module",
   "description": "Privacy-first, user-controlled memory tools for OpenCode with optional AES-256-GCM encryption, no session persistence, and atomic writes.",
   "main": "index.js",

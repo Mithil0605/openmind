@@ -1,4 +1,4 @@
-# OpenMind v2
+# OpenMind v3
 
 Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS.
 
@@ -25,7 +25,7 @@ Then restart OpenCode.
 After publishing this package to npm:
 
 ```bash
-opencode plugin openmind-v2 --global
+opencode plugin openmind-v3 --global
 ```
 
 Restart OpenCode after installation.

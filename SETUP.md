@@ -1,6 +1,6 @@
 # Easy Setup
 
-This is the simplest way to install OpenMind v2.
+This is the simplest way to install OpenMind v3.
 
 ## Before You Start
 
@@ -11,7 +11,7 @@ Install these first:
 
 ## Windows
 
-1. Download or unzip the `openmind-v2` folder.
+1. Download or unzip the `openmind-v3` folder.
 2. Open the folder.
 3. Double-click `install.cmd`.
 4. Restart OpenCode.
@@ -20,7 +20,7 @@ If Windows blocks the file, right-click `install.cmd`, choose **Properties**, se
 
 ## Linux or macOS
 
-Open a terminal in the `openmind-v2` folder and run:
+Open a terminal in the `openmind-v3` folder and run:
 
 ```bash
 sh ./install.sh
@@ -39,7 +39,7 @@ What do you remember about this project?
 
 ## Privacy and Deletion
 
-OpenMind v2 does not save session conversations. It stores only memories that are explicitly saved as project preferences.
+OpenMind v3 does not save session conversations. It stores only memories that are explicitly saved as project preferences.
 
 Ask OpenCode to delete a specific memory, delete memories matching a tag or phrase, or delete all OpenMind memory and its storage file. Matching deletions are previewed before permanent removal.
 

@@ -225,7 +225,7 @@ async function saveVault(file) {
 }
 
 // ---------------------------------------------------------------------------
-// Utility helpers (shared with v2).
+// Utility helpers (shared with v2/v3).
 // ---------------------------------------------------------------------------
 function now() {
   return new Date().toISOString();
@@ -400,7 +400,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
     tool: {
       memory_remember: tool({
         description:
-          "Explicitly save a durable OpenMind preference or project fact. Only project-scoped memories are stored; they belong to the worktree they are saved in. Never use this for conversational/session details; sessions are not saved by OpenMind v2. Identical or near-identical memories are updated instead of duplicated unless dedupe is false.",
+          "Explicitly save a durable OpenMind preference or project fact. Only project-scoped memories are stored; they belong to the worktree they are saved in. Never use this for conversational/session details; sessions are not saved by OpenMind v3. Identical or near-identical memories are updated instead of duplicated unless dedupe is false.",
         args: {
           text: tool.schema.string().min(1).max(MAX_TEXT_LENGTH).describe("The fact, preference, decision, or instruction to remember."),
           tags: tool.schema.array(tool.schema.string()).optional().describe("Optional tags for later recall."),
