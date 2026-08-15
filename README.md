@@ -194,16 +194,6 @@ npm pack
 
 `npm pack` creates a `.tgz` package that can be shared or published.
 
-## GitHub Release Checklist
 
-Before posting this repository publicly:
-
-```bash
-npm install
-npm test
-git init
-git add .
-git commit -m "Initial OpenCode memory extension"
-```
 
 Do not commit `node_modules/` or generated `.tgz` files. They are ignored by `.gitignore`.
