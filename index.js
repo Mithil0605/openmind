@@ -1,9 +1,15 @@
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, platform } from "node:os";
 import { randomBytes, randomUUID, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { tool } from "@opencode-ai/plugin";
+
+const execFileAsync = promisify(execFile);
+const IMG_HELPER = join(dirname(fileURLToPath(import.meta.url)), "lib", "imgread.py");
 
 const STORE_FILE = "memories.jsonl";
 const MAX_TEXT_LENGTH = 8000;
@@ -385,6 +391,60 @@ function memoryBlock(memories) {
 }
 
 // ---------------------------------------------------------------------------
+// image_read: JS-side fallback when the bundled python3 helper is unavailable.
+// Only ever reports image type/size; never echoes file or URL content.
+// ---------------------------------------------------------------------------
+const IMG_PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const IMG_GIF = Buffer.from("GIF8", "utf8");
+
+function imageSniff(buf) {
+  if (buf.length >= 8 && buf.subarray(0, 8).equals(IMG_PNG)) return "PNG (raster)";
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "JPEG (raster)";
+  if (buf.length >= 6 && buf.subarray(0, 6).equals(IMG_GIF)) return "GIF (animated raster)";
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return "BMP (raster)";
+  if (buf.length >= 12 && buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP")
+    return "WEBP (raster)";
+  if (buf.length >= 4 && ((buf[0] === 0x49 && buf[1] === 0x49) || (buf[0] === 0x4d && buf[1] === 0x4d))) return "TIFF (raster)";
+  if (buf.length >= 4 && buf.subarray(0, 4).toString("latin1") === "%PDF") return "PDF";
+  const head = buf.subarray(0, 32).toString("latin1").trimStart();
+  if (head.startsWith("<svg") || head.startsWith("<?xml")) return "SVG/XML (vector)";
+  return null;
+}
+
+function pngDims(buf) {
+  if (buf.length < 24) return "";
+  return ` ${buf.readUInt32BE(16)}x${buf.readUInt32BE(20)}`;
+}
+
+function fallbackImageInfo(target) {
+  if (!existsSync(target)) return `No such image file: ${target}`;
+  let head;
+  try {
+    head = readFileSync(target).subarray(0, 64);
+  } catch {
+    return "Could not read the image file.";
+  }
+  const kind = imageSniff(head);
+  if (!kind)
+    return "Not a recognized image format (PNG/JPEG/GIF/BMP/WEBP/TIFF/SVG/PDF). OpenMind image_read reads only image files.";
+  const extra = kind === "PNG (raster)" ? pngDims(head) : "";
+  return `${kind}${extra} detected. To OCR text or downscale, install python3 with Pillow and tesseract, then restart OpenCode.`;
+}
+
+// Cached: is the bundled python helper runnable in this environment?
+let pythonProbe = null;
+async function probePython() {
+  if (pythonProbe === null) {
+    pythonProbe = execFileAsync("python3", ["--version"], { timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
+    const settled = await pythonProbe;
+    pythonProbe = settled;
+  }
+  return pythonProbe;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin factory.
 // ---------------------------------------------------------------------------
 export const MemoryPlugin = async (_input, options = {}) => {
@@ -395,6 +455,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
     typeof options.password === "string" && options.password.trim()
       ? options.password
       : process.env.OPENCODE_MEMORY_PASSWORD || "";
+  const hasPython = await probePython();
 
   return {
     tool: {
@@ -669,6 +730,68 @@ export const MemoryPlugin = async (_input, options = {}) => {
               metadata: { file, count: exported.length },
             };
           });
+        },
+      }),
+
+      image_read: tool({
+        description:
+          "Read an image so the model can 'see' it: prints format, dimensions, OCR'd text, and (for large images) a downscaled copy. Accepts a local image path or an http(s) URL. Only image files are read (PNG/JPEG/GIF/BMP/WEBP/TIFF/SVG/PDF); any other file type is refused without showing its contents. URLs are SSRF-guarded: private, loopback, link-local, and cloud-metadata hosts are blocked. Optional OCR can be disabled for speed.",
+        args: {
+          target: tool.schema.string().min(1).max(2000).describe("Local image path or http(s):// image URL. Relative paths resolve against the current project directory."),
+          ocr: tool.schema.boolean().optional().describe("Run optical character recognition on the image (default true). Set false to speed up and skip text extraction."),
+          max: tool.schema.number().int().min(128).max(4096).optional().describe("Cap for the longest image side before downscaling (default 1400)."),
+        },
+        async execute(args, context) {
+          const rawTarget = String(args.target || "").trim();
+          if (!rawTarget) return "Provide a local image path or an http(s) image URL.";
+          if (rawTarget.length > 2000) return "The target is too long (maximum 2000 characters).";
+          if (/[\u0000-\u001f\u007f]/.test(rawTarget)) return "The target contains control characters and was rejected.";
+          if (rawTarget.startsWith("-")) return "The target must be a file path or an http(s) URL, not a flag.";
+
+          const isUrl = /^https?:\/\//i.test(rawTarget);
+          const ocr = args.ocr !== false;
+          const max = Math.max(128, Math.min(Number(args.max) || 1400, 4096));
+
+          let target = rawTarget;
+          if (!isUrl) {
+            const base = context.directory || context.worktree || process.cwd();
+            target = resolve(base, rawTarget);
+            if (!existsSync(target)) return `No such image file: ${rawTarget}`;
+          }
+
+          if (!hasPython) {
+            const note = isUrl
+              ? "URL reading is unavailable without python3: download the image first, then pass its local path."
+              : fallbackImageInfo(target);
+            return {
+              title: "Image read (limited)",
+              output: `python3 is not installed in this OpenCode environment.\n${note}\nInstall python3 with Pillow and tesseract for full image reading, then restart OpenCode.`,
+              metadata: { image: true, fallback: true },
+            };
+          }
+
+          const helperArgs = [IMG_HELPER, target, "--max", String(max)];
+          if (!ocr) helperArgs.push("--no-ocr");
+          try {
+            const { stdout } = await execFileAsync("python3", helperArgs, {
+              timeout: 60000,
+              maxBuffer: 4 * 1024 * 1024,
+            });
+            const text = String(stdout || "").trim();
+            if (!text) return "image_read returned no output.";
+            return {
+              title: "Image read",
+              output: text,
+              metadata: { image: true, ocr, max },
+            };
+          } catch (error) {
+            const reason = String(error.stdout || error.message || "image_read failed").trim();
+            return {
+              title: "Image read failed",
+              output: reason.length ? reason : "image_read failed while processing the image.",
+              metadata: { image: true, error: true },
+            };
+          }
         },
       }),
     },

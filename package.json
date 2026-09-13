@@ -1,14 +1,15 @@
 {
-  "name": "openmind-v3",
-  "version": "3.0.0",
+  "name": "openmind-v4",
+  "version": "4.0.0",
   "type": "module",
-  "description": "Privacy-first, user-controlled memory tools for OpenCode with optional AES-256-GCM encryption, no session persistence, and atomic writes.",
+  "description": "Privacy-first, user-controlled memory tools for OpenCode — with image reading and OCR — optional AES-256-GCM encryption, no session persistence, and atomic writes.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
   },
   "files": [
     "index.js",
+    "lib/imgread.py",
     "install.mjs",
     "install.sh",
     "install.ps1",
@@ -18,7 +19,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --check index.js && node test/smoke.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs",
+    "test": "node --check index.js && node test/smoke.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs && node test/image.mjs && node test/vapt.mjs",
     "pack:local": "npm pack",
     "setup": "node install.mjs"
   },
@@ -27,6 +28,8 @@
     "plugin",
     "openmind",
     "privacy",
+    "image",
+    "ocr",
     "windows",
     "linux"
   ],

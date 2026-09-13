@@ -1,6 +1,6 @@
-# OpenMind v3
+# OpenMind v4
 
-Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS.
+Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS — plus an SSRF-guarded image reader with OCR.
 
 OpenMind never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, or the entire backing store.
 
@@ -25,7 +25,7 @@ Then restart OpenCode.
 After publishing this package to npm:
 
 ```bash
-opencode plugin openmind-v3 --global
+opencode plugin openmind-v4 --global
 ```
 
 Restart OpenCode after installation.
@@ -91,6 +91,41 @@ Windows example:
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
 - `memory_delete_store`: permanently delete all memories and remove the storage file
 - `memory_export`: show/export stored memories
+- `image_read`: read an image so the model can "see" it — prints format, dimensions, OCR'd text, and a downscaled copy of large images. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
+
+## Image Reading
+
+`image_read` removes the common LLM image limitations at the CLI:
+
+- **Web URLs** — downloads public images automatically.
+- **Large images** — downscales over the `max` cap (default 1400) so the model can ingest them.
+- **Fine text / OCR** — runs `tesseract` and returns the extracted text directly.
+- **Vector images** — dumps SVG markup as text.
+- **Format support** — PNG, JPEG, GIF, BMP, WEBP, TIFF, SVG, plus a PDF-to-image hint.
+
+Examples the model can act on:
+
+```text
+Read the screenshot at ./assets/login.png and tell me what it shows.
+What text is on this QR code image? /data/qr.png
+Read the diagram at https://example.com/architecture.svg --no-ocr
+```
+
+`image_read` is deliberately refuse-by-default: it reads only image files and never echoes arbitrary file contents, so it cannot be misused as a file-exfiltration channel. If `python3` (with Pillow and tesseract) is not installed, OpenMind reports a safe fallback with basic type/dimension detection.
+
+## Security and VAPT
+
+OpenMind v4 ships with a built-in static and dynamic security test suite (`npm test` runs `node test/security.mjs`, `test/image.mjs`, and `test/vapt.mjs`):
+
+- **Input injection / fuzzing** — newline-forged records, prototype-pollution tags, oversized text, regex metacharacters in queries.
+- **Tampered and corrupt stores** — the plugin never crashes or leaks partial data.
+- **Symlink attacks** — atomic writes replace the file instead of writing through a link.
+- **Cross-process concurrency** — parallel writers never corrupt the JSONL format.
+- **Encryption** — AES-256-GCM authentication rejects tampered ciphertext; locked stores never disclose contents; 5-attempt lockout.
+- **Command injection** — `image_read` spawns the helper with an argument array (no shell); flag-like, control-character, and oversized targets are rejected up front.
+- **SSRF** — URL hosts are DNS-resolved and any private/loopback/link-local address (including `169.254.169.254`) blocks the fetch; redirects are re-checked per hop.
+- **No content leak** — refused file types and corrupt images report a safe message, never the file bytes.
+- **Permissions** — store files `0600`, directories `0700`.
 
 ## Encryption and Password
 
@@ -196,4 +231,4 @@ npm pack
 
 
 
-Do not commit `node_modules/` or generated `.tgz` files. They are ignored by `.gitignore`.
+Do not commit `node_modules/`, generated `.tgz` files, or `.env`. They are ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone.
