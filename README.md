@@ -91,7 +91,7 @@ Windows example:
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
 - `memory_delete_store`: permanently delete all memories and remove the storage file
 - `memory_export`: show/export stored memories
-- `image_read`: read an image so the model can "see" it — prints format, dimensions, OCR'd text, and a downscaled copy of large images. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
+- `image_read`: read an image so the model can "see" it — prints format, dimensions, OCR'd text, and the downscaled size of large images. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
 
 ## Image Reading
 
@@ -108,7 +108,7 @@ Examples the model can act on:
 ```text
 Read the screenshot at ./assets/login.png and tell me what it shows.
 What text is on this QR code image? /data/qr.png
-Read the diagram at https://example.com/architecture.svg --no-ocr
+Read the diagram at https://example.com/architecture.svg, no OCR needed.
 ```
 
 `image_read` is deliberately refuse-by-default: it reads only image files and never echoes arbitrary file contents, so it cannot be misused as a file-exfiltration channel. If `python3` (with Pillow and tesseract) is not installed, OpenMind reports a safe fallback with basic type/dimension detection.
@@ -227,8 +227,4 @@ npm test
 npm pack
 ```
 
-`npm pack` creates a `.tgz` package that can be shared or published.
-
-
-
-Do not commit `node_modules/`, generated `.tgz` files, or `.env`. They are ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone.
+`npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
