@@ -1,10 +1,34 @@
-# OpenMind v4
+# OpenMind v5
 
-Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS — plus an SSRF-guarded image reader with OCR.
+Privacy-first, user-controlled memory tools for OpenCode on Windows, Linux, and macOS — with an SSRF-guarded web listener/analyzer, image reading with OCR, and optional AES-256-GCM encryption.
 
 OpenMind never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, or the entire backing store.
 
 The store can be encrypted with AES-256-GCM. A password is verified like `sudo`, with a 5-attempt rate limit that locks access for 5 minutes after repeated failures.
+
+## The /listen Command
+
+OpenMind v5 adds the `/listen` slash command — a web listening, learning, and analysis tool that works through Firefox-compatible web fetching:
+
+1. Type `/listen` in the OpenCode chat.
+2. OpenMind asks: "What website URL should I listen to and analyze?"
+3. OpenMind then asks: "Should I learn from this website permanently (saved to OpenMind memory) or just analyze it this once?"
+4. It fetches and comprehensively analyzes the site: title, meta tags, Open Graph data, headings, paragraphs, links, images, code snippets, tables, lists, and detects the technology stack (React, Vue, Next.js, Tailwind, etc.).
+5. If you chose permanent learning, it saves the key findings to OpenMind memory with tags so they persist across sessions.
+
+`/listen` is SSRF-guarded — private IPs, loopback addresses, cloud metadata endpoints, `.local`/`.internal` domains, and link-local IPv6 are all blocked before any request is made.
+
+### What `/listen` Extracts
+
+- **Metadata**: title, description, author, keywords, canonical, robots
+- **Open Graph**: og:title, og:description, og:image, og:type, etc.
+- **Structure**: full heading hierarchy (H1–H6)
+- **Content**: paragraphs and full body text
+- **Navigation**: all external links with anchor text
+- **Media**: image sources and alt text
+- **Code**: all `<pre><code>` blocks
+- **Data**: all tables and lists
+- **Tech stack**: automatic detection of React, Vue, Angular, Next.js, Nuxt, Svelte, Tailwind, Bootstrap, jQuery, WordPress, Cloudflare, Nginx, Apache, Vercel, and more
 
 ## Easiest Install
 
@@ -92,6 +116,7 @@ Windows example:
 - `memory_delete_store`: permanently delete all memories and remove the storage file
 - `memory_export`: show/export stored memories
 - `image_read`: read an image so the model can "see" it — prints format, dimensions, OCR'd text, and the downscaled size of large images. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
+- `listen_analyze`: listen to, learn from, and comprehensively analyze any public website. Fetches the page, extracts metadata, Open Graph data, headings, links, images, code, tables, lists, full text, and detects the technology stack. SSRF-guarded against private/loopback/cloud-metadata hosts, with size, timeout, and content-type limits. Backed by the `/listen` slash command.
 
 ## Image Reading
 
@@ -115,7 +140,7 @@ Read the diagram at https://example.com/architecture.svg, no OCR needed.
 
 ## Security and VAPT
 
-OpenMind v4 ships with a built-in static and dynamic security test suite (`npm test` runs `node test/security.mjs`, `test/image.mjs`, and `test/vapt.mjs`):
+OpenMind v5 ships with a built-in static and dynamic security test suite (`npm test` runs `node test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, and `test/vapt.mjs`):
 
 - **Input injection / fuzzing** — newline-forged records, prototype-pollution tags, oversized text, regex metacharacters in queries.
 - **Tampered and corrupt stores** — the plugin never crashes or leaks partial data.
@@ -123,7 +148,9 @@ OpenMind v4 ships with a built-in static and dynamic security test suite (`npm t
 - **Cross-process concurrency** — parallel writers never corrupt the JSONL format.
 - **Encryption** — AES-256-GCM authentication rejects tampered ciphertext; locked stores never disclose contents; 5-attempt lockout.
 - **Command injection** — `image_read` spawns the helper with an argument array (no shell); flag-like, control-character, and oversized targets are rejected up front.
-- **SSRF** — URL hosts are DNS-resolved and any private/loopback/link-local address (including `169.254.169.254`) blocks the fetch; redirects are re-checked per hop.
+- **SSRF for image URLs** — URL hosts are DNS-resolved and any private/loopback/link-local address (including `169.254.169.254`) blocks the fetch; redirects are re-checked per hop.
+- **SSRF for web listening** — `listen_analyze` resolves the hostname with DNS and blocks private, loopback, link-local, reserved, `.local`, `.internal`, and cloud-metadata addresses before any request is made. Only `http`/`https` protocols are allowed.
+- **Web fetch limits** — 5MB response cap, 30s timeout, HTML content-type check, and early rejection of non-HTML responses.
 - **No content leak** — refused file types and corrupt images report a safe message, never the file bytes.
 - **Permissions** — store files `0600`, directories `0700`.
 

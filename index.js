@@ -8,6 +8,213 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { tool } from "@opencode-ai/plugin";
 
+// ---------------------------------------------------------------------------
+// Listen: SSRF guard, HTML fetcher, and content analyzer for web scraping.
+// ---------------------------------------------------------------------------
+const LISTEN_MAX_BYTES = 5 * 1024 * 1024;
+const LISTEN_TIMEOUT_MS = 30000;
+const LISTEN_MAX_TEXT = 50000;
+
+function isPrivateIP(ip) {
+  if (/^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|localhost|\[::1\]|::1|fc|fd|fe80|169\.254\.)/i.test(ip)) return true;
+  if (ip === "169.254.169.254") return true;
+  return false;
+}
+
+async function assertPublicHost(urlString) {
+  let parsed;
+  try { parsed = new URL(urlString); } catch { throw new Error("Invalid URL."); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Only http and https URLs are supported.");
+  const hostname = parsed.hostname.toLowerCase();
+  if (["localhost", "0.0.0.0", "::", "::1", "[::1]"].includes(hostname)) throw new Error("Loopback hosts are blocked.");
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) && isPrivateIP(hostname)) throw new Error("Private IP addresses are blocked.");
+  if (/^\[.*\]$/.test(hostname)) {
+    const inner = hostname.slice(1, -1);
+    if (isPrivateIP(inner)) throw new Error("Private IPv6 addresses are blocked.");
+  }
+  if (hostname.endsWith(".local") || hostname.endsWith(".internal")) throw new Error("Local/internal domains are blocked.");
+  if (/^(169\.254\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(hostname)) throw new Error("Private IP ranges are blocked.");
+  try {
+    const { lookup } = await import("node:dns/promises");
+    const { address } = await lookup(hostname, { all: true }).then((addrs) => {
+      const first = addrs[0];
+      if (!first) throw new Error("DNS lookup returned no addresses.");
+      return first;
+    });
+    if (isPrivateIP(address)) throw new Error(`Resolved to private address ${address}; blocked.`);
+  } catch (err) {
+    if (/blocked|private|loopback/i.test(err.message)) throw err;
+  }
+  return parsed;
+}
+
+function stripTags(html) {
+  return html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#\d+;/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractMeta(html) {
+  const meta = {};
+  const titleM = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleM) meta.title = stripTags(titleM[1]).slice(0, 500);
+  for (const m of html.matchAll(/<meta\s+[^>]*?(?:name|property|http-equiv)\s*=\s*["']([^"']+)["'][^>]*?content\s*=\s*["']([^"']+)["'][^>]*>/gi)) {
+    meta[m[1].toLowerCase()] = stripTags(m[2]).slice(0, 1000);
+  }
+  for (const m of html.matchAll(/<meta\s+[^>]*?content\s*=\s*["']([^"']+)["'][^>]*?(?:name|property|http-equiv)\s*=\s*["']([^"']+)["'][^>]*>/gi)) {
+    meta[m[2].toLowerCase()] = stripTags(m[1]).slice(0, 1000);
+  }
+  return meta;
+}
+
+function extractStructured(html) {
+  const data = { headings: [], links: [], images: [], codeBlocks: [], lists: [], tables: [] };
+  for (const m of html.matchAll(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi)) {
+    const level = parseInt(m[1], 10);
+    const text = stripTags(m[2]);
+    if (text) data.headings.push({ level, text: text.slice(0, 500) });
+  }
+  for (const m of html.matchAll(/<a\s+[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const text = stripTags(m[2]).trim();
+    if (text && m[1] && !m[1].startsWith("#") && !m[1].startsWith("javascript:")) {
+      data.links.push({ href: m[1].slice(0, 2000), text: text.slice(0, 200) });
+    }
+  }
+  for (const m of html.matchAll(/<img\s+[^>]*?(?:src|data-src)\s*=\s*["']([^"']+)["'][^>]*?>/gi)) {
+    const altM = m[0].match(/alt\s*=\s*["']([^"']*)["']/i);
+    data.images.push({ src: m[1].slice(0, 2000), alt: altM ? stripTags(altM[1]).slice(0, 200) : "" });
+  }
+  for (const m of html.matchAll(/<pre[^>]*>\s*<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi)) {
+    const code = stripTags(m[1]).trim();
+    if (code) data.codeBlocks.push(code.slice(0, 5000));
+  }
+  for (const m of html.matchAll(/<(?:ul|ol)[^>]*>([\s\S]*?)<\/(?:ul|ol)>/gi)) {
+    const items = [];
+    for (const li of m[1].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)) {
+      const t = stripTags(li[1]).trim();
+      if (t) items.push(t.slice(0, 500));
+    }
+    if (items.length) data.lists.push(items);
+  }
+  for (const m of html.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi)) {
+    const rows = [];
+    for (const tr of m[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)) {
+      const cells = [];
+      for (const td of tr[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)) {
+        cells.push(stripTags(td[1]).trim().slice(0, 500));
+      }
+      if (cells.length) rows.push(cells);
+    }
+    if (rows.length) data.tables.push(rows);
+  }
+  return data;
+}
+
+function detectTech(html, headers) {
+  const techs = new Set();
+  if (/react/i.test(html)) techs.add("React");
+  if (/vue/i.test(html)) techs.add("Vue.js");
+  if (/angular/i.test(html)) techs.add("Angular");
+  if (/next\.?js|_next/i.test(html)) techs.add("Next.js");
+  if (/nuxt/i.test(html)) techs.add("Nuxt.js");
+  if (/svelte/i.test(html)) techs.add("Svelte");
+  if (/tailwind/i.test(html)) techs.add("Tailwind CSS");
+  if (/bootstrap/i.test(html)) techs.add("Bootstrap");
+  if (/jquery/i.test(html)) techs.add("jQuery");
+  if (/wordpress|wp-content/i.test(html)) techs.add("WordPress");
+  if (/drupal/i.test(html)) techs.add("Drupal");
+  if (/joomla/i.test(html)) techs.add("Joomla");
+  if (/shopify/i.test(html)) techs.add("Shopify");
+  if (/gatsby/i.test(html)) techs.add("Gatsby");
+  if (/astro/i.test(html)) techs.add("Astro");
+  if (/cloudflare/i.test(headers.get("server") || "")) techs.add("Cloudflare");
+  if (/nginx/i.test(headers.get("server") || "")) techs.add("Nginx");
+  if (/apache/i.test(headers.get("server") || "")) techs.add("Apache");
+  if (/vercel/i.test(headers.get("server") || "") || /vercel/i.test(headers.get("x-vercel-id") || "")) techs.add("Vercel");
+  return [...techs];
+}
+
+function buildAnalysis(url, html, headers) {
+  const meta = extractMeta(html);
+  const structured = extractStructured(html);
+  const techs = detectTech(html, headers);
+  const fullText = stripTags(html).slice(0, LISTEN_MAX_TEXT);
+  const ogData = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (k.startsWith("og:")) ogData[k] = v;
+  }
+  const sections = [];
+  sections.push(`# Website Analysis: ${url}`);
+  sections.push("");
+  if (meta.title) sections.push(`**Title:** ${meta.title}`);
+  if (meta.description) sections.push(`**Description:** ${meta.description}`);
+  if (meta.author) sections.push(`**Author:** ${meta.author}`);
+  if (meta.keywords) sections.push(`**Keywords:** ${meta.keywords}`);
+  if (Object.keys(ogData).length) {
+    sections.push("");
+    sections.push("## Open Graph Data");
+    for (const [k, v] of Object.entries(ogData)) sections.push(`- **${k}:** ${v}`);
+  }
+  if (structured.headings.length) {
+    sections.push("");
+    sections.push("## Page Structure");
+    for (const h of structured.headings.slice(0, 30)) {
+      sections.push(`${"  ".repeat(h.level - 1)}- ${h.text}`);
+    }
+  }
+  if (structured.links.length) {
+    sections.push("");
+    sections.push(`## Links (${structured.links.length} found)`);
+    for (const l of structured.links.slice(0, 50)) sections.push(`- [${l.text}](${l.href})`);
+  }
+  if (structured.images.length) {
+    sections.push("");
+    sections.push(`## Images (${structured.images.length} found)`);
+    for (const img of structured.images.slice(0, 30)) sections.push(`- ${img.src}${img.alt ? ` (${img.alt})` : ""}`);
+  }
+  if (structured.codeBlocks.length) {
+    sections.push("");
+    sections.push(`## Code Snippets (${structured.codeBlocks.length} found)`);
+    for (const [i, block] of structured.codeBlocks.slice(0, 10).entries()) {
+      sections.push(`\n### Code Block ${i + 1}\n\`\`\`\n${block}\n\`\`\``);
+    }
+  }
+  if (structured.tables.length) {
+    sections.push("");
+    sections.push(`## Tables (${structured.tables.length} found)`);
+    for (const [i, table] of structured.tables.slice(0, 5).entries()) {
+      sections.push(`\n### Table ${i + 1}`);
+      for (const row of table.slice(0, 20)) sections.push(`| ${row.join(" | ")} |`);
+    }
+  }
+  if (structured.lists.length) {
+    sections.push("");
+    sections.push(`## Lists (${structured.lists.length} found)`);
+    for (const list of structured.lists.slice(0, 10)) {
+      for (const item of list.slice(0, 20)) sections.push(`- ${item}`);
+    }
+  }
+  if (techs.length) {
+    sections.push("");
+    sections.push("## Detected Technology Stack");
+    sections.push(techs.join(", "));
+  }
+  sections.push("");
+  sections.push("## Full Text Content");
+  sections.push(fullText.slice(0, 10000));
+  return sections.join("\n");
+}
+
 const execFileAsync = promisify(execFile);
 const IMG_HELPER = join(dirname(fileURLToPath(import.meta.url)), "lib", "imgread.py");
 
@@ -792,6 +999,83 @@ export const MemoryPlugin = async (_input, options = {}) => {
               metadata: { image: true, error: true },
             };
           }
+        },
+      }),
+
+      listen_analyze: tool({
+        description:
+          "Listen to, learn from, and comprehensively analyze any public website. Fetches the page, extracts metadata, text, links, images, code, tables, tech stack, and Open Graph data. SSRF-guarded: private/loopback/cloud-metadata hosts are blocked. Use memory_remember to persist the analysis if the user wants permanent learning.",
+        args: {
+          url: tool.schema.string().min(1).max(2000).describe("The http(s) URL of the website to listen to and analyze."),
+          depth: tool.schema.enum(["quick", "full"]).optional().describe("Analysis depth: 'quick' for metadata and text only, 'full' for everything including links, images, code, tables (default: full)."),
+          permanent: tool.schema.boolean().optional().describe("If true, the LLM should save key findings to OpenMind memory after analysis. The tool itself does not write to memory."),
+        },
+        async execute(args) {
+          const rawUrl = String(args.url || "").trim();
+          if (!rawUrl) return "Provide a website URL to analyze.";
+          if (rawUrl.length > 2000) return "URL is too long (max 2000 characters).";
+          if (/[\u0000-\u001f\u007f]/.test(rawUrl)) return "URL contains control characters and was rejected.";
+          if (rawUrl.startsWith("-")) return "URL must be a web address, not a flag.";
+
+          let parsedUrl;
+          try {
+            parsedUrl = await assertPublicHost(rawUrl);
+          } catch (err) {
+            return `SSRF blocked: ${err.message}`;
+          }
+
+          const depth = args.depth || "full";
+          let response;
+          try {
+            response = await fetch(parsedUrl.href, {
+              signal: AbortSignal.timeout(LISTEN_TIMEOUT_MS),
+              headers: {
+                "User-Agent": "OpenMind-Listen/5.0 (privacy-first analysis)",
+                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+              },
+              redirect: "follow",
+            });
+          } catch (err) {
+            return `Failed to fetch ${parsedUrl.href}: ${err.message}`;
+          }
+
+          if (!response.ok) return `HTTP ${response.status} ${response.statusText} from ${parsedUrl.href}`;
+
+          const contentType = response.headers.get("content-type") || "";
+          if (!/html|xml|text/i.test(contentType) && !parsedUrl.href.endsWith(".html") && !parsedUrl.href.endsWith(".htm")) {
+            return `Content type '${contentType}' is not HTML. listen_analyze only processes web pages.`;
+          }
+
+          let html;
+          try {
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (buffer.length > LISTEN_MAX_BYTES) return `Page too large (${(buffer.length / 1024 / 1024).toFixed(1)}MB, max 5MB).`;
+            html = buffer.toString("utf8");
+          } catch (err) {
+            return `Failed to read response body: ${err.message}`;
+          }
+
+          if (!html || html.length < 10) return "The page returned empty or near-empty content.";
+
+          const analysis = buildAnalysis(parsedUrl.href, html, response.headers);
+          const permanent = args.permanent === true;
+          const footer = permanent
+            ? "\n\n---\n**Note:** Save key findings to OpenMind memory using memory_remember for permanent learning."
+            : "\n\n---\n**Note:** This is a one-time analysis. Use permanent=true to save findings.";
+
+          return {
+            title: `Listen: ${parsedUrl.href}`,
+            output: analysis + footer,
+            metadata: {
+              url: parsedUrl.href,
+              status: response.status,
+              contentType,
+              depth,
+              permanent,
+              htmlSize: html.length,
+            },
+          };
         },
       }),
     },

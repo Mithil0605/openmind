@@ -2,6 +2,13 @@ node_modules/
 *.tgz
 .DS_Store
 .env
+.env.*
+!.env.example
 
 __pycache__/
 *.pyc
+
+.opencode/
+*.log
+tmp/
+temp/
