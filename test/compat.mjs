@@ -40,7 +40,7 @@ try {
   console.log("V4 compatibility: PASS (legacy project memory read, global legacy ignored)");
 
   // Encrypted v4-style store should migrate/read too
-  const unlock = await hooks.tool.memory_unlock.execute({ password: "compat-pw" }, ctx());
+  await hooks.tool.memory_unlock.execute({ password: "compat-pw" }, ctx());
   const after = await hooks.tool.memory_list.execute({}, ctx());
   assert(String(after).includes("V4 legacy memory"), "v5 lost v4 memory after encryption migration");
   const raw = await readFile(join(dir, "memories.jsonl"), "utf8");

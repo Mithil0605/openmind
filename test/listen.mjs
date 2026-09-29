@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import plugin from "../index.js";
+import plugin, { buildAnalysis } from "../index.js";
 
 const directory = await mkdtemp(join(tmpdir(), "openmind-listen-test-"));
 
@@ -140,26 +140,50 @@ try {
   // =========================================================================
   console.log("  HTML analysis function tests...");
 
-  // We test the internal functions by importing them indirectly through the module
-  // Since they're not exported, we test them via the tool with a mock server
-  // Instead, let's directly test the logic by examining what the tool produces
-  // with a real (but external) fetch. We'll use httpbin.org for this.
-
-  // Actually, let's test the HTML parsing by using the internal functions
-  // We can import them since the module is ESM
-  const mod = await import("../index.js");
-
-  // The functions are not exported, but we can test the overall behavior
-  // by checking what the tool returns for various inputs.
-
-  // For now, let's verify the tool handles non-HTML content correctly
-  // (This tests the content-type check in the tool)
+  // data: URLs must be rejected before any fetch is attempted.
   const nonHtml = await hooks.tool.listen_analyze.execute(
     { url: "data:text/plain,hello" },
     ctx,
   );
-  // data: URLs should be rejected (not http/https)
   assert(/blocked|invalid|only http/i.test(String(nonHtml.output || nonHtml)), "data: URL not rejected");
+
+  // buildAnalysis is exported so the parser can be tested directly, without a
+  // live server (the SSRF guard blocks loopback on purpose).
+  const analysis = buildAnalysis("https://example.com/pricing", SAMPLE_HTML, {
+    "content-type": "text/html; charset=utf-8",
+  });
+
+  assert(analysis.includes("# Website Analysis: https://example.com/pricing"), "analysis header missing");
+  assert(analysis.includes("**Title:** Test Page - OpenMind Listen"), "title meta not extracted");
+  assert(/A test page for OpenMind listen analysis/.test(analysis), "description meta not extracted");
+  assert(analysis.includes("Test Author"), "author meta not extracted");
+
+  // Open Graph entries must be surfaced separately from the plain meta tags.
+  assert(/## Open Graph Data/.test(analysis), "Open Graph section missing");
+  assert(analysis.includes("Test OG Title"), "og:title not extracted");
+
+  assert(analysis.includes("- Welcome to Test Page"), "headings not extracted");
+  assert(analysis.includes("https://example.com/link1"), "links not extracted");
+  assert(analysis.includes("https://example.com/photo.jpg"), "images not extracted");
+  assert(/const x = 42/.test(analysis), "code block not extracted");
+  assert(analysis.includes("| Name | Value |"), "table not extracted");
+  assert(/Item A/.test(analysis), "list items not extracted");
+  assert(/Welcome to Test Page/.test(analysis), "visible body text not extracted");
+  assert(!/This is a paragraph with\s*<\/p>/.test(analysis), "stray markup in text section");
+
+  // javascript: hrefs must never be emitted as actionable links.
+  assert(!analysis.includes("](javascript:"), "javascript: link was not stripped");
+
+  // A page with no recognizable framework markers should not invent any.
+  const bare = buildAnalysis("https://example.com/", "<html><body><p>hi</p></body></html>", {
+    "content-type": "text/html",
+  });
+  assert(!/## Detected Technology Stack/.test(bare), "tech stack invented for a bare page");
+  assert(bare.includes("hi"), "bare page text not extracted");
+
+  // Meta-less, tag-less input must not throw.
+  const junk = buildAnalysis("https://example.com/", "", { "content-type": "text/html" });
+  assert(typeof junk === "string" && junk.length > 0, "empty HTML produced no analysis");
 
   console.log("    HTML analysis: PASS");
 

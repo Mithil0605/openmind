@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The plugin declares node >=22. Keep the oldest supported line in CI so
+        # an accidental use of a newer API fails here, not in someone's install.
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `npm ci` fails outright on a lockfile that disagrees with package.json,
+      # which is exactly the drift this workflow exists to catch.
+      - name: Install
+        run: npm ci
+
+      # eslint runs first and on its own: a parse error or an undefined reference
+      # must report as lint failure, not vanish behind a chained test script.
+      - name: Lint
+        run: npm run lint
+
+      - name: Syntax check
+        run: node --check index.js
+
+      - name: Test
+        run: npm run test:unit

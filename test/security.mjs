@@ -41,13 +41,13 @@ try {
   assert(injectedBack && injectedBack.id === injected.metadata.id, "newline text injected a forged record");
   assert(exported.memories.length === 1, "injection created extra records");
 
-  const poly = await hooks.tool.memory_remember.execute(
+  await hooks.tool.memory_remember.execute(
     { text: "prototype pollution probe", tags: ["__proto__", "constructor", "hasOwnProperty"], scope: "project" },
     ctx,
   );
   assert(({}).polluted === undefined && ({})["data-polluted"] === undefined, "prototype was polluted");
 
-  const manyTags = await hooks.tool.memory_remember.execute(
+  await hooks.tool.memory_remember.execute(
     { text: "tag cap probe", tags: Array.from({ length: 200 }, (_, i) => `t${i}`), scope: "project" },
     ctx,
   );

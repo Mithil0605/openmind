@@ -19,7 +19,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --check index.js && node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs",
+    "lint": "eslint .",
+    "test:unit": "node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs",
+    "test": "npm run lint && node --check index.js && npm run test:unit",
     "pack:local": "npm pack",
     "setup": "node install.mjs"
   },
@@ -50,5 +52,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5"
   }
 }

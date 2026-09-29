@@ -23,7 +23,7 @@ OpenMind v5 adds the `/listen` slash command — a web listening, learning, and 
 - **Metadata**: title, description, author, keywords, canonical, robots
 - **Open Graph**: og:title, og:description, og:image, og:type, etc.
 - **Structure**: full heading hierarchy (H1–H6)
-- **Content**: paragraphs and full body text
+- **Content**: paragraphs and body text, trimmed to the first 10,000 characters
 - **Navigation**: all external links with anchor text
 - **Media**: image sources and alt text
 - **Code**: all `<pre><code>` blocks
@@ -49,7 +49,7 @@ Then restart OpenCode.
 After publishing this package to npm:
 
 ```bash
-opencode plugin openmind-v4 --global
+opencode plugin openmind-v5 --global
 ```
 
 Restart OpenCode after installation.
@@ -114,6 +114,7 @@ Windows example:
 - `memory_forget`: permanently delete a memory by id
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
 - `memory_delete_store`: permanently delete all memories and remove the storage file
+- `memory_reassign`: list and rebind orphaned memories (records whose recorded project path is no longer the current worktree, e.g. after the directory was renamed or moved). Orphaned memories are invisible to every other tool, so this is the recovery path.
 - `memory_export`: show/export stored memories
 - `image_read`: read an image so the model can "see" it — prints format, dimensions, OCR'd text, and the downscaled size of large images. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
 - `listen_analyze`: listen to, learn from, and comprehensively analyze any public website. Fetches the page, extracts metadata, Open Graph data, headings, links, images, code, tables, lists, full text, and detects the technology stack. SSRF-guarded against private/loopback/cloud-metadata hosts, with size, timeout, and content-type limits. Backed by the `/listen` slash command.
@@ -122,9 +123,9 @@ Windows example:
 
 `image_read` removes the common LLM image limitations at the CLI:
 
-- **Web URLs** — downloads public images automatically.
+- **Web URLs** — downloads public images automatically (requires `python3`).
 - **Large images** — downscales over the `max` cap (default 1400) so the model can ingest them.
-- **Fine text / OCR** — runs `tesseract` and returns the extracted text directly.
+- **Fine text / OCR** — runs `tesseract` directly (no Python needed) and returns the extracted text. `python3` + Pillow is used as a fallback path when tesseract itself is unavailable.
 - **Vector images** — dumps SVG markup as text.
 - **Format support** — PNG, JPEG, GIF, BMP, WEBP, TIFF, SVG, plus a PDF-to-image hint.
 
@@ -136,17 +137,18 @@ What text is on this QR code image? /data/qr.png
 Read the diagram at https://example.com/architecture.svg, no OCR needed.
 ```
 
-`image_read` is deliberately refuse-by-default: it reads only image files and never echoes arbitrary file contents, so it cannot be misused as a file-exfiltration channel. If `python3` (with Pillow and tesseract) is not installed, OpenMind reports a safe fallback with basic type/dimension detection.
+`image_read` is deliberately refuse-by-default: it reads only image files and never echoes arbitrary file contents, so it cannot be misused as a file-exfiltration channel. If `python3` (with Pillow) is not installed, OpenMind falls back to JavaScript: it reads only the first 64 bytes to report type and dimensions, attempts OCR via `tesseract`, and URL reading is unavailable.
 
 ## Security and VAPT
 
-OpenMind v5 ships with a built-in static and dynamic security test suite (`npm test` runs `node test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, and `test/vapt.mjs`):
+OpenMind v5 ships with a built-in static and dynamic security test suite, plus eslint and a GitHub Actions workflow that runs both on every push. `npm test` runs lint and all nine suites: `test/smoke.mjs`, `test/compat.mjs`, `test/encryption.mjs`, `test/locked.mjs`, `test/concurrency.mjs`, `test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, and `test/vapt.mjs`:
 
 - **Input injection / fuzzing** — newline-forged records, prototype-pollution tags, oversized text, regex metacharacters in queries.
 - **Tampered and corrupt stores** — the plugin never crashes or leaks partial data.
 - **Symlink attacks** — atomic writes replace the file instead of writing through a link.
-- **Cross-process concurrency** — parallel writers never corrupt the JSONL format.
-- **Encryption** — AES-256-GCM authentication rejects tampered ciphertext; locked stores never disclose contents; 5-attempt lockout.
+- **Cross-process concurrency** — parallel writers never corrupt the JSONL format; a stale lock is only stolen after a grace period, and a holder only ever removes a lockfile carrying its own token.
+- **Context budget** — injection is capped by total characters, not just a memory count, so one oversized memory cannot crowd out the rest.
+- **Encryption** — AES-256-GCM authentication rejects tampered ciphertext; locked stores never disclose contents; 5-attempt lockout that only counts failures from the interactive `memory_unlock` path.
 - **Command injection** — `image_read` spawns the helper with an argument array (no shell); flag-like, control-character, and oversized targets are rejected up front.
 - **SSRF for image URLs** — URL hosts are DNS-resolved and any private/loopback/link-local address (including `169.254.169.254`) blocks the fetch; redirects are re-checked per hop.
 - **SSRF for web listening** — `listen_analyze` resolves the hostname with DNS and blocks private, loopback, link-local, reserved, `.local`, `.internal`, and cloud-metadata addresses before any request is made. Only `http`/`https` protocols are allowed.
@@ -164,8 +166,8 @@ Unlock the memory store with my password.
 
 OpenMind will prompt for the password and call `memory_unlock`. On a new store this sets the password and encrypts it; on an existing plaintext store it migrates the contents to the encrypted format in place.
 
-- Encrypted files start with the `OPENMIND_ENC_V2` header followed by `salt:iv:authTag:ciphertext` (AES-256-GCM, keyed by scrypt). Saved memory text is never stored in plaintext.
-- Wrong passwords are counted. After 5 failed attempts, access is locked for 5 minutes. `memory_unlock` reports the number of attempts remaining.
+- Encrypted files start with the `OPENMIND_ENC_V3` header, then a `scrypt,n=<N>,r=<R>,p=<P>` line recording the key-derivation parameters used for that file, then `salt:iv:authTag:ciphertext` (AES-256-GCM, keyed by scrypt). Recording the parameters means a future cost increase never invalidates an existing store. Older `OPENMIND_ENC_V2` files are still readable and are transparently migrated to v3 on the next successful unlock.
+- Wrong passwords are counted. After 5 failed attempts, access is locked for 5 minutes. `memory_unlock` reports the number of attempts remaining. Only the interactive unlock counts as an attempt: an ambient `OPENCODE_MEMORY_PASSWORD` that fails to decrypt does not burn the budget.
 - While locked, read and write tools answer with instructions to run `memory_unlock` instead of exposing data.
 
 To avoid typing the password each session, set it once in the environment or plugin config:
@@ -188,13 +190,63 @@ Or in the plugin config:
 }
 ```
 
-Note: the password is kept in memory for the life of the OpenCode process. It is never written to the store.
+To keep the password out of the config file entirely, point at a `0600` file:
+
+```json
+{
+  "plugin": [
+    ["opencode-memory-extension", {
+      "passwordFile": "~/.config/opencode/memory.pw",
+      "autoInject": true
+    }]
+  ]
+}
+```
+
+`passwordFile` (or `OPENCODE_MEMORY_PASSWORD_FILE`) reads the password from disk and refuses to proceed if the file is group- or world-readable on non-Windows systems. Note: the password is kept in memory for the life of the OpenCode process, and its SHA-256 (never the password itself) is used as the derived-key cache key. It is never written to the store.
 
 ## Scopes
 
 - `project`: the only scope. A memory belongs to the worktree it was saved in and is visible only in that project.
 
 There is deliberately no `global` or `session` scope. Only project-scoped memories are stored; legacy global or session records created by earlier versions are ignored and never surfaced.
+
+### Moving or renaming a project
+
+A memory records the absolute worktree path it was saved under. Rename the project directory, move it, or open it from a different path and its memories become **orphaned**: `memory_recall`, `memory_list`, `memory_update`, `memory_forget`, and `memory_prune` all filter by exact path match, so those memories become invisible and unreachable.
+
+`memory_reassign` is the recovery path:
+
+```text
+Show me any orphaned OpenMind memories.
+Reassign all orphaned memories to this project.
+```
+
+It lists orphans without changing anything, then rebinds them to the current worktree on confirmation. After that they behave like any other project memory.
+
+If you open the same project from several paths on purpose, set `namespace` (or `OPENCODE_MEMORY_NAMESPACE`) instead. That makes every path map to one shared project key:
+
+```json
+{
+  "plugin": [
+    ["opencode-memory-extension", {
+      "namespace": "my-monorepo",
+      "autoInject": true
+    }]
+  ]
+}
+```
+
+Namespace changes the stored key format to `ns:<name>`; memories saved before the change are not migrated automatically.
+
+## Injection budget
+
+Saved memories are injected into the system prompt on every turn. Two settings control how much:
+
+- `injectLimit` (default 8, max 25): how many memories are considered, pinned first, then most recently updated.
+- `injectMaxChars` (default 4000, max 40000): hard cap on total characters injected per turn.
+
+Each memory is clipped to `injectItemMaxChars` (default 400) before the budget is spent, so several short preferences always beat one long note. With the defaults an 8000-character memory contributes 400 characters instead of 8000.
 
 ## Storage
 
