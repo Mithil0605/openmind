@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, lstat } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, platform } from "node:os";
@@ -6,46 +6,237 @@ import { randomBytes, randomUUID, scryptSync, createCipheriv, createDecipheriv }
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { lookup } from "node:dns/promises";
+import http from "node:http";
+import https from "node:https";
 import { tool } from "@opencode-ai/plugin";
 
 // ---------------------------------------------------------------------------
-// Listen: SSRF guard, HTML fetcher, and content analyzer for web scraping.
+// Listen: hardened SSRF guard + streaming HTML fetcher for /listen analysis.
+//
+// Defense in depth:
+//   1. scheme + port allowlist
+//   2. hostname checks (loopback, .local, .internal, numeric IPs, IPv6 literals)
+//   3. DNS screening of EVERY resolved address (not just the first record)
+//   4. a connect-time lookup that re-resolves and screens the addresses the
+//      socket actually uses, which defeats classic DNS rebinding
+//   5. per-hop re-validation of every redirect, with a redirect cap
+//   6. bodies are streamed, so the size cap is enforced while downloading
+//      (the previous code only checked size after buffering the whole body)
 // ---------------------------------------------------------------------------
 const LISTEN_MAX_BYTES = 5 * 1024 * 1024;
+const LISTEN_QUICK_BYTES = 512 * 1024;
 const LISTEN_TIMEOUT_MS = 30000;
 const LISTEN_MAX_TEXT = 50000;
+const LISTEN_MAX_REDIRECTS = 5;
+const ALLOWED_PORTS = new Set([80, 443, 8000, 8080, 8443]);
+
+function ipv4ToInt(ip) {
+  const parts = String(ip).split(".");
+  if (parts.length !== 4) return null;
+  const nums = parts.map(Number);
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return ((((nums[0] << 24) >>> 0) + (nums[1] << 16) + (nums[2] << 8) + nums[3]) >>> 0);
+}
+
+function privateIPv4(ip) {
+  const v = ipv4ToInt(ip);
+  if (v === null) return true; // Not a clean dotted quad -> treat as untrusted.
+  const has = (prefix, bits) => (v >>> (32 - bits)) === (prefix >>> (32 - bits));
+  return (
+    has(0x00000000, 8) ||   // 0.0.0.0/8 "this network"
+    has(0x0a000000, 8) ||   // 10.0.0.0/8
+    has(0x64400000, 10) ||  // 100.64.0.0/10 CGNAT
+    has(0x7f000000, 8) ||   // 127.0.0.0/8 loopback
+    has(0xa9fe0000, 16) ||  // 169.254.0.0/16 link-local (incl. cloud metadata)
+    has(0xac100000, 12) ||  // 172.16.0.0/12
+    has(0xc0000000, 24) ||  // 192.0.0.0/24 IETF protocol assignments
+    has(0xc0000200, 24) ||  // 192.0.2.0/24 TEST-NET-1
+    has(0xc0a80000, 16) ||  // 192.168.0.0/16
+    has(0xc6120000, 15) ||  // 198.18.0.0/15 benchmarking
+    has(0xc6336400, 24) ||  // 198.51.100.0/24 TEST-NET-2
+    has(0xcb007100, 24) ||  // 203.0.113.0/24 TEST-NET-3
+    has(0xe0000000, 4) ||   // 224.0.0.0/4 multicast
+    has(0xf0000000, 4) ||   // 240.0.0.0/4 reserved
+    v === 0xffffffff        // 255.255.255.255
+  );
+}
+
+function ipv4MappedToV4(inner) {
+  if (inner.includes(".")) return privateIPv4(inner);
+  const parts = inner.split(":").filter(Boolean);
+  if (parts.length !== 2) return null;
+  const hi = parseInt(parts[0], 16);
+  const lo = parseInt(parts[1], 16);
+  if (!Number.isInteger(hi) || !Number.isInteger(lo) || hi < 0 || lo < 0) return null;
+  const v = ((hi << 16) | lo) >>> 0;
+  return privateIPv4(`${v >>> 24}.${(v >>> 16) & 0xff}.${(v >>> 8) & 0xff}.${v & 0xff}`);
+}
 
 function isPrivateIP(ip) {
-  if (/^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|localhost|\[::1\]|::1|fc|fd|fe80|169\.254\.)/i.test(ip)) return true;
-  if (ip === "169.254.169.254") return true;
+  let clean = String(ip || "").toLowerCase();
+  const zone = clean.indexOf("%");
+  if (zone !== -1) clean = clean.slice(0, zone);
+  if (!clean) return true;
+  if (!clean.includes(":")) return privateIPv4(clean);
+  const mapped = clean.match(/^::ffff:([0-9a-f:.]+)$/);
+  if (mapped) {
+    const result = ipv4MappedToV4(mapped[1]);
+    return result === null ? true : result;
+  }
+  if (clean.startsWith("::")) return true; // ::, ::1, ::ffff:..., IPv4-compatible 6to4 literals
+  if (/^fe[89ab]:/.test(clean)) return true;   // fe80::/10 link-local
+  if (/^f[cd]:/.test(clean)) return true;      // fc00::/7 unique-local
+  if (/^ff:/.test(clean)) return true;         // ff00::/8 multicast
+  if (/^64:ff9b:/.test(clean)) return true;    // 64:ff9b::/96 NAT64 well-known prefix
+  if (/^2001:db8:/.test(clean)) return true;   // 2001:db8::/32 documentation range
   return false;
+}
+
+async function resolvePublicAddresses(hostname) {
+  const all = await lookup(hostname, { all: true, verbatim: true });
+  if (!all || !all.length) throw new Error("DNS lookup returned no addresses.");
+  const bad = all.filter((a) => isPrivateIP(a.address));
+  if (bad.length) {
+    const names = [...new Set(bad.map((b) => b.address))].join(", ");
+    throw new Error(`Resolved to non-public address${bad.length > 1 ? "es" : ""} ${names}; blocked.`);
+  }
+  return all;
+}
+
+// Screen at connect time: this lookup is what the socket uses to resolve the
+// host, so even a post-validation DNS flip to a private address can never be
+// connected to.
+function publicOnlyLookup(hostname, options, callback) {
+  resolvePublicAddresses(hostname)
+    .then((addrs) => {
+      if (options && options.all) {
+        callback(null, addrs.map((a) => ({ address: a.address, family: a.family === 6 ? 6 : 4 })), 0);
+        return;
+      }
+      const first = addrs[0];
+      callback(null, first.address, first.family === 6 ? 6 : 4);
+    })
+    .catch((err) => callback(err));
 }
 
 async function assertPublicHost(urlString) {
   let parsed;
   try { parsed = new URL(urlString); } catch { throw new Error("Invalid URL."); }
   if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Only http and https URLs are supported.");
+  const defaultPort = parsed.protocol === "https:" ? 443 : 80;
+  const port = parsed.port ? Number(parsed.port) : defaultPort;
+  if (!ALLOWED_PORTS.has(port)) throw new Error(`Port ${port} is not on the allowlist (${[...ALLOWED_PORTS].join(", ")}).`);
   const hostname = parsed.hostname.toLowerCase();
-  if (["localhost", "0.0.0.0", "::", "::1", "[::1]"].includes(hostname)) throw new Error("Loopback hosts are blocked.");
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) && isPrivateIP(hostname)) throw new Error("Private IP addresses are blocked.");
+  if (["localhost", "0.0.0.0", "::", "::1", "[::1]", "[::]"].includes(hostname)) throw new Error("Loopback hosts are blocked.");
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) && privateIPv4(hostname)) throw new Error("Private IP addresses are blocked.");
   if (/^\[.*\]$/.test(hostname)) {
     const inner = hostname.slice(1, -1);
     if (isPrivateIP(inner)) throw new Error("Private IPv6 addresses are blocked.");
   }
   if (hostname.endsWith(".local") || hostname.endsWith(".internal")) throw new Error("Local/internal domains are blocked.");
-  if (/^(169\.254\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(hostname)) throw new Error("Private IP ranges are blocked.");
-  try {
-    const { lookup } = await import("node:dns/promises");
-    const { address } = await lookup(hostname, { all: true }).then((addrs) => {
-      const first = addrs[0];
-      if (!first) throw new Error("DNS lookup returned no addresses.");
-      return first;
-    });
-    if (isPrivateIP(address)) throw new Error(`Resolved to private address ${address}; blocked.`);
-  } catch (err) {
-    if (/blocked|private|loopback/i.test(err.message)) throw err;
-  }
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) return parsed; // public numeric literal; no DNS round-trip needed
+  await resolvePublicAddresses(hostname); // screens ALL A/AAAA records
   return parsed;
+}
+
+function httpRequestOnce(parsed, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const transport = parsed.protocol === "https:" ? https : http;
+    const hostname = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+    const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
+    const req = transport.request(
+      {
+        hostname,
+        port,
+        path: parsed.pathname + parsed.search,
+        method: "GET",
+        headers: {
+          "User-Agent": "OpenMind-Listen/5.1 (privacy-first analysis)",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.5",
+        },
+        lookup: publicOnlyLookup,
+      },
+      (res) => resolve(res),
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("Fetch timed out.")));
+    req.on("error", (err) => reject(err));
+    req.end();
+  });
+}
+
+function allowHtmlContent(contentType, href) {
+  const ct = contentType || "";
+  if (/html|xml|text/i.test(ct)) return true;
+  return /\.html?$/i.test(href);
+}
+
+async function fetchPublicHtml(
+  url,
+  { maxBytes = LISTEN_MAX_BYTES, allowPrivate = false, timeoutMs = LISTEN_TIMEOUT_MS, redirects = LISTEN_MAX_REDIRECTS } = {},
+) {
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new Error("Invalid URL."); }
+  if (!allowPrivate) await assertPublicHost(parsed.href);
+  if (redirects < 0) throw new Error("Too many redirects.");
+
+  const res = await httpRequestOnce(parsed, timeoutMs);
+  const status = res.statusCode || 0;
+  const contentType = res.headers["content-type"] || "";
+
+  if (status >= 300 && status < 400 && res.headers.location) {
+    res.resume();
+    let nextHref;
+    try { nextHref = new URL(res.headers.location, parsed.href).href; } catch { throw new Error("Invalid redirect location."); }
+    return fetchPublicHtml(nextHref, { maxBytes, allowPrivate, timeoutMs, redirects: redirects - 1 });
+  }
+
+  if (status < 200 || status >= 300) {
+    res.resume();
+    throw new Error(`HTTP ${status}${res.statusMessage ? ` ${res.statusMessage}` : ""}`.trim());
+  }
+
+  if (!allowHtmlContent(contentType, parsed.href)) {
+    res.resume();
+    throw new Error(`Content type '${contentType || "(none)"}' is not HTML. listen_analyze only processes web pages.`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      res.destroy();
+      reject(new Error("Fetch timed out while reading the body."));
+    }, timeoutMs);
+    res.on("data", (chunk) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(`Page too large (over ${(maxBytes / 1024 / 1024).toFixed(1)}MB).`));
+        res.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    res.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    res.on("end", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ href: parsed.href, status, contentType, headers: res.headers, buffer: Buffer.concat(chunks) });
+    });
+  });
 }
 
 function stripTags(html) {
@@ -122,25 +313,32 @@ function extractStructured(html) {
 
 function detectTech(html, headers) {
   const techs = new Set();
-  if (/react/i.test(html)) techs.add("React");
-  if (/vue/i.test(html)) techs.add("Vue.js");
-  if (/angular/i.test(html)) techs.add("Angular");
-  if (/next\.?js|_next/i.test(html)) techs.add("Next.js");
-  if (/nuxt/i.test(html)) techs.add("Nuxt.js");
-  if (/svelte/i.test(html)) techs.add("Svelte");
-  if (/tailwind/i.test(html)) techs.add("Tailwind CSS");
-  if (/bootstrap/i.test(html)) techs.add("Bootstrap");
-  if (/jquery/i.test(html)) techs.add("jQuery");
-  if (/wordpress|wp-content/i.test(html)) techs.add("WordPress");
-  if (/drupal/i.test(html)) techs.add("Drupal");
-  if (/joomla/i.test(html)) techs.add("Joomla");
-  if (/shopify/i.test(html)) techs.add("Shopify");
-  if (/gatsby/i.test(html)) techs.add("Gatsby");
-  if (/astro/i.test(html)) techs.add("Astro");
-  if (/cloudflare/i.test(headers.get("server") || "")) techs.add("Cloudflare");
-  if (/nginx/i.test(headers.get("server") || "")) techs.add("Nginx");
-  if (/apache/i.test(headers.get("server") || "")) techs.add("Apache");
-  if (/vercel/i.test(headers.get("server") || "") || /vercel/i.test(headers.get("x-vercel-id") || "")) techs.add("Vercel");
+  const genMeta = html.match(/<meta[^>]*name=["']generator["'][^>]*content=["']([^"']+)["']/i) || [null, ""];
+  const head = html.slice(0, 65536);
+  const scriptTags = [...head.matchAll(/<script[^>]*>/gi)].map((m) => m[0]).join(" ");
+  const rootAttrs = (html.match(/<(?:html|body)[^>]*>/i) || [""])[0];
+  const corpus = `${genMeta[1]} ${scriptTags} ${rootAttrs}`;
+  const c = corpus.toLowerCase();
+  if (/react/i.test(c)) techs.add("React");
+  if (/vue|nuxt/i.test(c)) techs.add("Vue.js");
+  if (/angular/i.test(c)) techs.add("Angular");
+  if (/next\.?js|_next/i.test(c)) techs.add("Next.js");
+  if (/nuxt/i.test(c)) techs.add("Nuxt.js");
+  if (/svelte/i.test(c)) techs.add("Svelte");
+  if (/tailwind/i.test(c)) techs.add("Tailwind CSS");
+  if (/bootstrap/i.test(c)) techs.add("Bootstrap");
+  if (/jquery/i.test(c)) techs.add("jQuery");
+  if (/wordpress|wp-content|wp-include/i.test(c)) techs.add("WordPress");
+  if (/drupal/i.test(c)) techs.add("Drupal");
+  if (/joomla/i.test(c)) techs.add("Joomla");
+  if (/shopify/i.test(c)) techs.add("Shopify");
+  if (/gatsby/i.test(c)) techs.add("Gatsby");
+  if (/astro/i.test(c)) techs.add("Astro");
+  const server = String((headers && headers.server) || "");
+  if (/cloudflare/i.test(server)) techs.add("Cloudflare");
+  if (/nginx/i.test(server)) techs.add("Nginx");
+  if (/apache/i.test(server)) techs.add("Apache");
+  if (/vercel/i.test(server) || /vercel/i.test(String((headers && headers["x-vercel-id"]) || ""))) techs.add("Vercel");
   return [...techs];
 }
 
@@ -222,10 +420,73 @@ const STORE_FILE = "memories.jsonl";
 const MAX_TEXT_LENGTH = 8000;
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 5 * 60 * 1000;
-const ENC_HEADER = "OPENMIND_ENC_V2\n";
+const LOCKOUT_FILE = "lockout.json";
+
+// Encrypted store format:
+//   OPENMIND_ENC_V3
+//   scrypt,n=<N>,r=<R>,p=<P>          <- KDF parameters used for this file
+//   <salt>:<iv>:<authTag>:<ciphertext>
+// Legacy OPENMIND_ENC_V2 files (no KDF line, weaker scrypt cost) are still
+// readable and are transparently migrated to v3 on the next successful unlock.
+const ENC_V3_HEADER = "OPENMIND_ENC_V3\n";
+const ENC_V2_HEADER = "OPENMIND_ENC_V2\n";
+
+// Stronger-than-default scrypt cost. Derived keys are cached per
+// (password, salt, params) and each store reuses its own salt, so re-encrypting
+// the same store (every save) never pays the KDF cost twice.
+const KDF_PARAMS = { n: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+const LEGACY_KDF_PARAMS = { n: 1 << 15, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
 
 const LOCK_MSG =
   "OpenMind: the memory store is encrypted and locked. Call memory_unlock with your password to access saved preferences.";
+
+// ---------------------------------------------------------------------------
+// Persistent password lockout. The counter lives on disk next to the store, so
+// restarting opencode (or running several sessions in parallel) cannot reset
+// it: 5 consecutive failures lock access to the store for 5 minutes.
+// ---------------------------------------------------------------------------
+async function readLockout(file) {
+  const path = join(dirname(file), LOCKOUT_FILE);
+  try {
+    const data = JSON.parse(await readFile(path, "utf8"));
+    if (
+      typeof data.count === "number" &&
+      typeof data.lastFailureAt === "number" &&
+      typeof data.lockedUntil === "number"
+    ) {
+      return { count: data.count, lastFailureAt: data.lastFailureAt, lockedUntil: data.lockedUntil };
+    }
+  } catch {}
+  return { count: 0, lastFailureAt: 0, lockedUntil: 0 };
+}
+
+async function writeLockout(file, data) {
+  await writeAtomic(join(dirname(file), LOCKOUT_FILE), JSON.stringify(data));
+}
+
+async function recordFailure(file) {
+  const data = await readLockout(file);
+  data.count += 1;
+  data.lastFailureAt = Date.now();
+  if (data.count >= MAX_ATTEMPTS) {
+    data.lockedUntil = Date.now() + LOCKOUT_MS;
+    data.count = 0;
+  }
+  await writeLockout(file, data);
+}
+
+async function recordSuccess(file) {
+  await writeLockout(file, { count: 0, lastFailureAt: 0, lockedUntil: 0 });
+}
+
+async function lockedOutFor(file) {
+  const data = await readLockout(file);
+  if (data.lockedUntil > Date.now()) return Math.ceil((data.lockedUntil - Date.now()) / 1000);
+  if (data.lastFailureAt && Date.now() - data.lastFailureAt > LOCKOUT_MS) {
+    await writeLockout(file, { count: 0, lastFailureAt: 0, lockedUntil: 0 });
+  }
+  return 0;
+}
 
 // ---------------------------------------------------------------------------
 // In-process write lock. Every store read-modify-write runs through withLock so
@@ -243,36 +504,112 @@ function withLock(fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Encryption (AES-256-GCM keyed by scrypt) and on-disk format.
-// Encrypted files start with ENC_HEADER followed by salt:iv:authTag:ciphertext.
-// Plaintext legacy JSONL stores are detected and can be migrated on unlock.
+// Cross-process store lock. A lockfile serializes read-modify-write cycles
+// across concurrent opencode processes so no session loses updates and no line
+// is ever torn by an interleaved append. Stale locks from a crashed process are
+// stolen after a grace period.
 // ---------------------------------------------------------------------------
-function deriveKey(password, salt) {
-  return scryptSync(password, salt, 32, { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+const LOCK_WAIT_MS = 10000;
+const LOCK_STALE_MS = 120000;
+
+async function acquireLock(lockPath) {
+  const start = Date.now();
+  for (;;) {
+    try {
+      return await open(lockPath, "wx", 0o600);
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      try {
+        const info = await stat(lockPath);
+        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {}
+      if (Date.now() - start > LOCK_WAIT_MS) throw new Error("Timed out waiting for the store lock.");
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
 }
 
-function encryptPayload(password, entries) {
-  const salt = randomBytes(16);
+async function withFileLock(lockPath, fn) {
+  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const handle = await acquireLock(lockPath);
+  try {
+    return await fn();
+  } finally {
+    await handle.close();
+    await rm(lockPath, { force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Encryption (AES-256-GCM keyed by scrypt) and on-disk format.
+// Encrypted files carry the KDF parameters in their header so future parameter
+// bumps never invalidate existing stores; v2 files use the legacy parameters.
+// ---------------------------------------------------------------------------
+const keyCache = new Map();
+
+function deriveKey(password, salt, params) {
+  const p = params || KDF_PARAMS;
+  const tag = `${password.length}:${password}:${salt.toString("base64")}:${p.n}:${p.r}:${p.p}`;
+  const cached = keyCache.get(tag);
+  if (cached) return cached;
+  const key = scryptSync(password, salt, 32, { N: p.n, r: p.r, p: p.p, maxmem: p.maxmem });
+  if (keyCache.size >= 64) keyCache.clear();
+  keyCache.set(tag, key);
+  return key;
+}
+
+function kdfParamsFromLine(line) {
+  const m = /^scrypt,n=(\d+),r=(\d+),p=(\d+)$/.exec(String(line || "").trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  const r = Number(m[2]);
+  const p = Number(m[3]);
+  if (!Number.isInteger(n) || !Number.isInteger(r) || !Number.isInteger(p) || n < 1 << 14 || r < 1 || p < 1) return null;
+  return { n, r, p, maxmem: Math.max(64 * 1024 * 1024, 128 * n * r * 2) };
+}
+
+function encryptPayload(password, entries, params, salt) {
+  const kp = params || KDF_PARAMS;
+  const usedSalt = salt || randomBytes(16);
   const iv = randomBytes(12);
-  const key = deriveKey(password, salt);
+  const key = deriveKey(password, usedSalt, kp);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const body = Buffer.from(JSON.stringify(entries), "utf8");
   const encrypted = Buffer.concat([cipher.update(body), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return [salt, iv, tag, encrypted].map((part) => part.toString("base64")).join(":");
+  return { payload: [usedSalt, iv, tag, encrypted].map((part) => part.toString("base64")).join(":"), salt: usedSalt };
 }
 
-function decryptPayload(payload, password) {
+function decryptPayload(payload, password, params) {
   const [saltB64, ivB64, tagB64, ciphertextB64] = payload.split(":");
+  if (!saltB64 || !ivB64 || !tagB64 || !ciphertextB64) throw new Error("Malformed encrypted payload.");
   const salt = Buffer.from(saltB64, "base64");
   const iv = Buffer.from(ivB64, "base64");
   const tag = Buffer.from(tagB64, "base64");
   const ciphertext = Buffer.from(ciphertextB64, "base64");
-  const key = deriveKey(password, salt);
+  const key = deriveKey(password, salt, params || LEGACY_KDF_PARAMS);
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
   const body = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(body.toString("utf8"));
+}
+
+function parseEncrypted(raw) {
+  if (raw.startsWith(ENC_V3_HEADER)) {
+    const lines = raw.split("\n");
+    const params = kdfParamsFromLine(lines[1]);
+    if (!params) return { corrupt: true };
+    const payload = lines.slice(2).join("\n").trim();
+    return { params, salt: payload.split(":")[0], payload, legacy: false };
+  }
+  if (raw.startsWith(ENC_V2_HEADER)) {
+    const payload = raw.slice(ENC_V2_HEADER.length).trim();
+    return { params: LEGACY_KDF_PARAMS, salt: payload.split(":")[0], payload, legacy: true };
+  }
+  return null;
 }
 
 async function writeAtomic(file, body) {
@@ -292,8 +629,31 @@ async function writeAtomic(file, body) {
   await rename(tmp, file);
 }
 
-async function writeEncrypted(file, password, entries) {
-  await writeAtomic(file, ENC_HEADER + encryptPayload(password, entries));
+async function writeEncrypted(file, password, entries, opts = {}) {
+  const params = opts.params || KDF_PARAMS;
+  const { payload, salt } = encryptPayload(password, entries, params, opts.salt || null);
+  const body = `${ENC_V3_HEADER}scrypt,n=${params.n},r=${params.r},p=${params.p}\n${payload}\n`;
+  await writeAtomic(file, body);
+  return salt;
+}
+
+// New plaintext keys are appended in O(1) instead of rewriting the whole JSONL
+// file on every save. Never appends through a symlink (falls back to an atomic
+// replace, which swaps the link for a real file without touching its target).
+async function appendPlaintextLine(file, entry) {
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  try {
+    const linked = await lstat(file);
+    if (linked.isSymbolicLink()) return false;
+  } catch {}
+  const handle = await open(file, "a", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return true;
 }
 
 async function writePlaintext(file, entries) {
@@ -331,52 +691,38 @@ function parseLegacyLine(line) {
 }
 
 async function readStoreRaw(file) {
-  if (!existsSync(file)) return { kind: "missing", mtimeMs: 0, entries: [] };
+  if (!existsSync(file)) return { kind: "missing", mtimeMs: 0, entries: [], params: null, salt: null };
   const [raw, info] = await Promise.all([readFile(file, "utf8"), stat(file)]);
-  if (raw.startsWith(ENC_HEADER)) {
-    return { kind: "encrypted", payload: raw.slice(ENC_HEADER.length).trim(), mtimeMs: info.mtimeMs, entries: [] };
+  const enc = parseEncrypted(raw);
+  if (enc) {
+    if (enc.corrupt) return { kind: "corrupt", mtimeMs: info.mtimeMs, entries: [], params: null, salt: null };
+    return { kind: "encrypted", payload: enc.payload, params: enc.params, salt: enc.salt, legacy: enc.legacy, mtimeMs: info.mtimeMs, entries: [] };
   }
   const entries = raw.split("\n").filter(Boolean).map(parseLegacyLine).filter(Boolean);
-  return { kind: "plaintext", mtimeMs: info.mtimeMs, entries };
+  return { kind: "plaintext", mtimeMs: info.mtimeMs, entries, params: null, salt: null };
 }
 
 // ---------------------------------------------------------------------------
-// Vault state (in-memory cache) and password rate limiter.
+// Vault state (in-memory cache) and persistent password rate limiter.
 // ---------------------------------------------------------------------------
-let vault = { file: null, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs: 0 };
-let attempts = { count: 0, lastFailureAt: 0, lockedUntil: 0 };
-
-function recordFailure() {
-  attempts.count += 1;
-  attempts.lastFailureAt = Date.now();
-  if (attempts.count >= MAX_ATTEMPTS) {
-    attempts.lockedUntil = Date.now() + LOCKOUT_MS;
-    attempts.count = 0;
-  }
-}
-
-function recordSuccess() {
-  attempts.count = 0;
-  attempts.lastFailureAt = 0;
-}
-
-function lockedOutFor() {
-  if (attempts.lockedUntil > Date.now()) return Math.ceil((attempts.lockedUntil - Date.now()) / 1000);
-  if (attempts.lastFailureAt && Date.now() - attempts.lastFailureAt > LOCKOUT_MS) attempts.count = 0;
-  return 0;
-}
+let vault = { file: null, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs: 0, salt: null, params: null };
 
 async function loadVault(file, autoPassword) {
   const raw = await readStoreRaw(file);
-  vault = { file, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs: raw.mtimeMs };
+  vault = { file, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs: raw.mtimeMs, salt: raw.salt, params: raw.params };
 
   if (raw.kind === "missing") {
     if (autoPassword) {
-      await writeEncrypted(file, autoPassword, []);
-      vault = { file, mode: "encrypted", entries: [], encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs };
+      const salt = await writeEncrypted(file, autoPassword, []);
+      vault = { file, mode: "encrypted", entries: [], encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS };
     } else {
       vault.mode = "plaintext";
     }
+    return;
+  }
+
+  if (raw.kind === "corrupt") {
+    vault.mode = "locked";
     return;
   }
 
@@ -384,23 +730,24 @@ async function loadVault(file, autoPassword) {
     vault.entries = raw.entries;
     vault.mode = "plaintext";
     if (autoPassword) {
-      await writeEncrypted(file, autoPassword, vault.entries);
-      vault.encrypted = true;
-      vault.mode = "encrypted";
-      vault.password = autoPassword;
-      vault.mtimeMs = (await stat(file)).mtimeMs;
+      const salt = await writeEncrypted(file, autoPassword, vault.entries);
+      vault = { file, mode: "encrypted", entries: vault.entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS };
     }
     return;
   }
 
   if (autoPassword) {
     try {
-      vault.entries = decryptPayload(raw.payload, autoPassword).map(sanitizeEntry).filter(Boolean);
-      vault.mode = "encrypted";
-      vault.encrypted = true;
-      vault.password = autoPassword;
+      const entries = decryptPayload(raw.payload, autoPassword, raw.params).map(sanitizeEntry).filter(Boolean);
+      let salt = raw.salt;
+      let params = raw.params;
+      if (raw.legacy) {
+        salt = await writeEncrypted(file, autoPassword, entries);
+        params = KDF_PARAMS;
+      }
+      vault = { file, mode: "encrypted", entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params };
     } catch {
-      recordFailure();
+      await recordFailure(file);
       vault.mode = "locked";
     }
   } else {
@@ -422,7 +769,12 @@ async function ensureLoaded(file, autoPassword) {
 async function saveVault(file) {
   if (vault.mode === "encrypted") {
     if (!vault.password) throw new Error("OpenMind: cannot write the encrypted store without its password.");
-    await writeEncrypted(file, vault.password, vault.entries);
+    const salt = await writeEncrypted(file, vault.password, vault.entries, {
+      salt: vault.salt || null,
+      params: vault.params || KDF_PARAMS,
+    });
+    vault.salt = salt;
+    vault.params = vault.params || KDF_PARAMS;
     vault.mtimeMs = (await stat(file)).mtimeMs;
   } else if (vault.mode === "plaintext") {
     if (vault.entries.length === 0) {
@@ -472,7 +824,13 @@ function defaultDirectory() {
   return join(base, "opencode-memory");
 }
 
+// A per-session namespace lets several worktrees (e.g. the same repo cloned in
+// different places) share one logical project. When unset, each worktree keeps
+// its own private memory as before.
+let projectNamespace = null;
+
 function projectKey(context) {
+  if (projectNamespace) return `ns:${projectNamespace}`;
   return context?.worktree || context?.directory || process.cwd();
 }
 
@@ -623,7 +981,7 @@ function pngDims(buf) {
   return ` ${buf.readUInt32BE(16)}x${buf.readUInt32BE(20)}`;
 }
 
-function fallbackImageInfo(target) {
+async function fallbackImageInfo(target) {
   if (!existsSync(target)) return `No such image file: ${target}`;
   let head;
   try {
@@ -635,7 +993,57 @@ function fallbackImageInfo(target) {
   if (!kind)
     return "Not a recognized image format (PNG/JPEG/GIF/BMP/WEBP/TIFF/SVG/PDF). OpenMind image_read reads only image files.";
   const extra = kind === "PNG (raster)" ? pngDims(head) : "";
-  return `${kind}${extra} detected. To OCR text or downscale, install python3 with Pillow and tesseract, then restart OpenCode.`;
+
+  // Real OCR probe: try the tesseract engine directly, then python3+Pillow.
+  // This is what makes image_read actually readable instead of silent
+  // metadata-only on hosts without tesseract/python.
+  const text = await tryOcr(target);
+  if (text) return `${kind}${extra}\n\nOCR text:\n${text}`;
+  return `${kind}${extra} detected. To OCR text from a raster image, install tesseract-ocr (no Python needed) or python3 with Pillow and tesseract, then restart OpenCode.`;
+}
+
+const OCR_TIMEOUT_MS = 20000;
+const OCR_MAX_BYTES = 1 * 1024 * 1024; // OCR text output is small
+let tesseractAvailable = null;
+async function tesseractPresent() {
+  if (tesseractAvailable === null) {
+    try {
+      await execFileAsync("tesseract", ["--version"], { timeout: 5000 });
+      tesseractAvailable = true;
+    } catch {
+      tesseractAvailable = false;
+    }
+  }
+  return tesseractAvailable;
+}
+
+async function tryOcr(target) {
+  // 1. Direct tesseract engine (fastest, no Python dependency).
+  if (await tesseractPresent()) {
+    try {
+      const { stdout } = await execFileAsync("tesseract", [target, "stdout"], {
+        timeout: OCR_TIMEOUT_MS,
+        maxBuffer: OCR_MAX_BYTES,
+      });
+      const text = String(stdout).trim();
+      if (text) return text;
+    } catch {
+      // tesseract errored (bad language data, etc.) -> fall through
+    }
+  }
+  // 2. python3 + Pillow (also needs tesseract binary or pytesseract).
+  try {
+    const { stdout } = await execFileAsync(
+      "python3",
+      ["-c", PY_IMAGE_READ_SCRIPT, "read", target],
+      { timeout: OCR_TIMEOUT_MS, maxBuffer: OCR_MAX_BYTES },
+    );
+    const text = String(stdout).trim();
+    if (text) return text;
+  } catch {
+    // python3/Pillow unavailable
+  }
+  return null;
 }
 
 // Cached: is the bundled python helper runnable in this environment?
@@ -658,11 +1066,35 @@ export const MemoryPlugin = async (_input, options = {}) => {
   const file = storagePath(options);
   const autoInject = options.autoInject !== false;
   const injectLimit = Math.max(1, Math.min(Number(options.injectLimit || 8), 25));
-  const autoPassword =
+  projectNamespace = String(options.namespace || process.env.OPENCODE_MEMORY_NAMESPACE || "").trim() || null;
+  // Password may come from a 0600 secret file instead of being written inline in
+  // the plugin config, so it never sits in plaintext next to the config.
+  let autoPassword =
     typeof options.password === "string" && options.password.trim()
       ? options.password
       : process.env.OPENCODE_MEMORY_PASSWORD || "";
+  const passwordFile =
+    typeof options.passwordFile === "string" && options.passwordFile.trim()
+      ? options.passwordFile.trim().replace(/^~(?=$|[/\\])/, homedir())
+      : process.env.OPENCODE_MEMORY_PASSWORD_FILE || "";
+  if (!autoPassword && passwordFile && existsSync(passwordFile)) {
+    try {
+      const info = await stat(passwordFile);
+      if (process.platform !== "win32" && info.mode & 0o077) {
+        throw new Error(`password file ${passwordFile} is too permissive; chmod 600 it.`);
+      }
+      autoPassword = readFileSync(passwordFile, "utf8").trim();
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        autoPassword = "";
+      } else {
+        throw err;
+      }
+    }
+  }
   const hasPython = await probePython();
+  // In-process serialization + cross-process lockfile around every mutation.
+  const withStoreGuard = (fn) => withLock(() => withFileLock(`${file}.lock`, fn));
 
   return {
     tool: {
@@ -685,7 +1117,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           const pinned = Boolean(args.pinned);
           const timestamp = now();
 
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
 
@@ -720,7 +1152,16 @@ export const MemoryPlugin = async (_input, options = {}) => {
               outcome = { updated: false, memory };
             }
 
-            await saveVault(file);
+            if (!outcome.updated && vault.mode === "plaintext") {
+              const appended = await appendPlaintextLine(file, outcome.memory);
+              if (appended) {
+                vault.mtimeMs = (await stat(file)).mtimeMs;
+              } else {
+                await saveVault(file);
+              }
+            } else {
+              await saveVault(file);
+            }
             return {
               title: outcome.updated ? "Memory updated" : "Memory saved",
               output: `${outcome.updated ? "Updated existing memory (deduplicated).\n" : ""}${formatMemory(outcome.memory)}`,
@@ -740,7 +1181,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           pinned: tool.schema.boolean().optional().describe("Set or clear the pinned flag."),
         },
         async execute(args, context) {
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
             const memory = vault.entries.find((entry) => entry.id === args.id && visibleTo(entry, context));
@@ -765,7 +1206,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           limit: tool.schema.number().int().min(1).max(50).optional().describe("Maximum memories to return."),
         },
         async execute(args, context) {
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
             const memories = filterMemories(vault.entries, context, args);
@@ -780,7 +1221,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           limit: tool.schema.number().int().min(1).max(50).optional().describe("Maximum memories to return."),
         },
         async execute(args, context) {
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
             const limit = Math.max(1, Math.min(Number(args.limit || 20), 50));
@@ -801,33 +1242,43 @@ export const MemoryPlugin = async (_input, options = {}) => {
         },
         async execute(args) {
           const password = String(args.password || "");
-          const locked = lockedOutFor();
+          const locked = await lockedOutFor(file);
           if (locked > 0) return `OpenMind: too many failed password attempts. Access locked for ${locked}s.`;
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             if (!password) return "A password is required to unlock the encrypted OpenMind store.";
             const raw = await readStoreRaw(file);
             if (raw.kind === "encrypted") {
               try {
-                const entries = decryptPayload(raw.payload, password);
-                vault = { file, mode: "encrypted", entries, encrypted: true, password, mtimeMs: raw.mtimeMs };
-                recordSuccess();
+                const entries = decryptPayload(raw.payload, password, raw.params);
+                let salt = raw.salt;
+                let params = raw.params;
+                if (raw.legacy) {
+                  salt = await writeEncrypted(file, password, entries);
+                  params = KDF_PARAMS;
+                }
+                vault = { file, mode: "encrypted", entries, encrypted: true, password, mtimeMs: (await stat(file)).mtimeMs, salt, params };
+                await recordSuccess(file);
                 return `OpenMind store unlocked. ${entries.length} memory item(s) available.`;
               } catch {
-                recordFailure();
-                const lockedSeconds = lockedOutFor();
+                await recordFailure(file);
+                const lockedSeconds = await lockedOutFor(file);
                 if (lockedSeconds > 0) return `Incorrect password. Too many failed attempts; access locked for ${lockedSeconds}s.`;
-                return `Incorrect password. ${MAX_ATTEMPTS - attempts.count} attempt(s) remaining.`;
+                const remaining = MAX_ATTEMPTS - (await readLockout(file)).count;
+                return `Incorrect password. ${Math.max(0, remaining)} attempt(s) remaining.`;
               }
             }
             if (raw.kind === "missing") {
-              await writeEncrypted(file, password, []);
-              vault = { file, mode: "encrypted", entries: [], encrypted: true, password, mtimeMs: (await stat(file)).mtimeMs };
-              recordSuccess();
+              const salt = await writeEncrypted(file, password, []);
+              vault = { file, mode: "encrypted", entries: [], encrypted: true, password, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS };
+              await recordSuccess(file);
               return "Created an encrypted OpenMind store and set its password.";
             }
-            await writeEncrypted(file, password, raw.entries);
-            vault = { file, mode: "encrypted", entries: raw.entries, encrypted: true, password, mtimeMs: (await stat(file)).mtimeMs };
-            recordSuccess();
+            if (raw.kind === "corrupt") {
+              return "The store is corrupt or has been tampered with and cannot be unlocked.";
+            }
+            const salt = await writeEncrypted(file, password, raw.entries);
+            vault = { file, mode: "encrypted", entries: raw.entries, encrypted: true, password, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS };
+            await recordSuccess(file);
             return `Store migrated to encryption. ${raw.entries.length} memory item(s) preserved.`;
           });
         },
@@ -839,7 +1290,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           id: tool.schema.string().min(1).describe("The memory id to delete."),
         },
         async execute(args, context) {
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
             const index = vault.entries.findIndex((memory) => memory.id === args.id && visibleTo(memory, context));
@@ -866,7 +1317,7 @@ export const MemoryPlugin = async (_input, options = {}) => {
           const tags = asArray(args.tags).map((tag) => tag.toLowerCase());
           if (ids.size === 0 && !query && tags.length === 0)
             return "Choose at least one id, query, or tag before deleting memories.";
-          return withLock(async () => {
+          return withStoreGuard(async () => {
             await ensureLoaded(file, autoPassword);
             if (vault.mode === "locked") return LOCK_MSG;
             const matches = vault.entries.filter((memory) => {
@@ -1025,51 +1476,37 @@ export const MemoryPlugin = async (_input, options = {}) => {
           }
 
           const depth = args.depth || "full";
-          let response;
+          const chunkBudget = depth === "quick" ? LISTEN_QUICK_BYTES : LISTEN_MAX_BYTES;
+          let result;
           try {
-            response = await fetch(parsedUrl.href, {
-              signal: AbortSignal.timeout(LISTEN_TIMEOUT_MS),
-              headers: {
-                "User-Agent": "OpenMind-Listen/5.0 (privacy-first analysis)",
-                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-              },
-              redirect: "follow",
-            });
+            result = await fetchPublicHtml(parsedUrl.href, { maxBytes: chunkBudget, redirects: LISTEN_MAX_REDIRECTS });
           } catch (err) {
             return `Failed to fetch ${parsedUrl.href}: ${err.message}`;
           }
 
-          if (!response.ok) return `HTTP ${response.status} ${response.statusText} from ${parsedUrl.href}`;
-
-          const contentType = response.headers.get("content-type") || "";
-          if (!/html|xml|text/i.test(contentType) && !parsedUrl.href.endsWith(".html") && !parsedUrl.href.endsWith(".htm")) {
-            return `Content type '${contentType}' is not HTML. listen_analyze only processes web pages.`;
-          }
-
-          let html;
-          try {
-            const buffer = Buffer.from(await response.arrayBuffer());
-            if (buffer.length > LISTEN_MAX_BYTES) return `Page too large (${(buffer.length / 1024 / 1024).toFixed(1)}MB, max 5MB).`;
-            html = buffer.toString("utf8");
-          } catch (err) {
-            return `Failed to read response body: ${err.message}`;
-          }
+          const finalUrl = result.href;
+          const status = result.status;
+          const contentType = result.contentType;
+          const html = result.buffer.toString("utf8");
 
           if (!html || html.length < 10) return "The page returned empty or near-empty content.";
 
-          const analysis = buildAnalysis(parsedUrl.href, html, response.headers);
+          const analysis = buildAnalysis(finalUrl, html, result.headers);
           const permanent = args.permanent === true;
+          const spaNote =
+            stripTags(html).trim().length < 200 && /<script[^>]*>/i.test(html)
+              ? "\n\n---\n**Note:** This page returned almost no visible text — it is likely client-rendered (JavaScript). Try the site's API or a rendered snapshot."
+              : "";
           const footer = permanent
             ? "\n\n---\n**Note:** Save key findings to OpenMind memory using memory_remember for permanent learning."
             : "\n\n---\n**Note:** This is a one-time analysis. Use permanent=true to save findings.";
 
           return {
-            title: `Listen: ${parsedUrl.href}`,
-            output: analysis + footer,
+            title: `Listen: ${finalUrl}`,
+            output: analysis + spaNote + footer,
             metadata: {
-              url: parsedUrl.href,
-              status: response.status,
+              url: finalUrl,
+              status,
               contentType,
               depth,
               permanent,

@@ -98,13 +98,10 @@ try {
   await secureHooks.tool.memory_remember.execute({ text: "top secret value", scope: "project" }, secureCtx);
   const secureFile = join(secure, "memories.jsonl");
   const rawEnc = (await readFile(secureFile, "utf8")).split("\n");
-  const body = rawEnc[1];
-  const parts = body.split(":");
-  const cipher = parts[parts.length - 1];
-  const mid = Math.floor(cipher.length / 2);
-  parts[parts.length - 1] =
-    cipher.slice(0, mid) + (cipher[mid] === "A" ? "B" : "A") + cipher.slice(mid + 1);
-  rawEnc[1] = parts.join(":");
+  if (rawEnc[0] !== "OPENMIND_ENC_V3") throw new Error("expected a V3-encrypted store to tamper");
+  const body = rawEnc[2];
+  const mid = Math.floor(body.length / 2);
+  rawEnc[2] = body.slice(0, mid) + (body[mid] === "A" ? "B" : "A") + body.slice(mid + 1);
   await writeFile(secureFile, rawEnc.join("\n"));
   const reread = await readFile(secureFile, "utf8");
   assert(reread.split("\n")[1] !== body, "tamper did not change the ciphertext");

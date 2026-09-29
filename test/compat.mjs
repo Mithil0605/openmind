@@ -44,7 +44,7 @@ try {
   const after = await hooks.tool.memory_list.execute({}, ctx());
   assert(String(after).includes("V4 legacy memory"), "v5 lost v4 memory after encryption migration");
   const raw = await readFile(join(dir, "memories.jsonl"), "utf8");
-  assert(raw.startsWith("OPENMIND_ENC_V2"), "store was not encrypted in v5 format");
+  assert(raw.startsWith("OPENMIND_ENC_V3"), "store was not encrypted in v5 format");
   console.log("V4 encrypted migration: PASS");
 
   const recall = await hooks.tool.memory_recall.execute({ query: "test project", limit: 5 }, ctx());

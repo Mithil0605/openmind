@@ -35,7 +35,9 @@ try {
   if (!String(migrated).includes("migrated")) throw new Error("memory_unlock did not migrate the store");
 
   const raw = await readFile(file, "utf8");
-  if (!raw.startsWith("OPENMIND_ENC_V2")) throw new Error("store was not encrypted after unlock");
+  if (!raw.startsWith("OPENMIND_ENC_V3")) throw new Error("store was not encrypted in v5/V3 format after unlock");
+  const kdfLine = raw.split("\n")[1];
+  if (!/^scrypt,n=\d+,r=\d+,p=\d+$/.test(kdfLine)) throw new Error("missing KDF params line in encrypted store");
   if (raw.includes("secret preference")) throw new Error("plaintext leaked into the encrypted store");
 
   const duplicate = await hooks.tool.memory_remember.execute(
