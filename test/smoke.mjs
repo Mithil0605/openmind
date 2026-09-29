@@ -188,6 +188,32 @@ try {
   } finally {
     await rm(orphanStore, { recursive: true, force: true });
   }
+
+  // Ranking: pinning must not hijack relevance. A pinned memory that matches one
+  // incidental term must lose to an unpinned memory that matches the query.
+  const rankDir = await mkdtemp(join(tmpdir(), "opencode-memory-rank-"));
+  try {
+    const ranked = await plugin({ directory: rankDir, worktree: rankDir }, { directory: rankDir });
+    const rankCtx = { ...context, directory: rankDir, worktree: rankDir };
+
+    await ranked.tool.memory_remember.execute(
+      { text: "deployment notes mention a github repository and a handoff", pinned: true, dedupe: false },
+      rankCtx,
+    );
+    await ranked.tool.memory_remember.execute(
+      { text: "identity profile: sample user, github handle, personal projects", dedupe: false },
+      rankCtx,
+    );
+
+    const hits = String(await ranked.tool.memory_recall.execute({ query: "identity sample", limit: 5 }, rankCtx));
+    // formatMemory puts the id on the first line and the text on the second.
+    const topEntry = hits.split("\n\n")[0];
+    if (!topEntry.includes("identity profile")) {
+      throw new Error(`rank test: pinned memory outranked the exact match; got: ${topEntry.replace(/\n/g, " ")}`);
+    }
+  } finally {
+    await rm(rankDir, { recursive: true, force: true });
+  }
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

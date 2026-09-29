@@ -919,6 +919,7 @@ function isDuplicate(a, b) {
 // BM25-style ranking with negated terms. A leading `-` before a token in the
 // query excludes any memory that contains it.
 // ---------------------------------------------------------------------------
+const PINNED_BOOST = 1.4;
 function bm25Documents(entries, tokens) {
   const k1 = 1.5;
   const b = 0.75;
@@ -979,7 +980,13 @@ function filterMemories(memories, context, args = {}) {
   return scored
     .filter((doc) => !negative.some((term) => doc.unique.has(term)))
     .filter((doc) => doc.score > 0)
-    .map((doc) => ({ entry: doc.entry, score: doc.score + (doc.entry.pinned ? 25 : 0) }))
+    .map((doc) => ({
+      entry: doc.entry,
+      // A flat bonus would swamp BM25, whose scores live in roughly 0-10: a
+      // pinned memory matching one incidental term would outrank an exact match.
+      // A multiplier only reorders near-ties.
+      score: doc.score * (doc.entry.pinned ? PINNED_BOOST : 1),
+    }))
     .sort((a, b) => b.score - a.score || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
     .slice(0, limit)
     .map(({ entry }) => entry);
