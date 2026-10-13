@@ -1897,11 +1897,14 @@ async function tryOcr(target) {
   return null;
 }
 
-// Cached: is the bundled python helper runnable in this environment?
+// Cached: is the bundled python helper actually usable in this environment?
+// `python3 --version` is not enough: the helper's core work (resize, PDF,
+// attachments, URL reads) needs Pillow, so a bare python3 without PIL must take
+// the header-only JavaScript fallback rather than half-run the helper.
 let pythonProbe = null;
 async function probePython() {
   if (pythonProbe === null) {
-    pythonProbe = execFileAsync("python3", ["--version"], { timeout: 5000 })
+    pythonProbe = execFileAsync("python3", ["-c", "import PIL"], { timeout: 5000 })
       .then(() => true)
       .catch(() => false);
     const settled = await pythonProbe;
@@ -2580,7 +2583,7 @@ async execute(args, context) {
             return {
               title: "Image read (limited)",
               output:
-                `python3 is not installed in this OpenCode environment, so image_read ran in header-only mode: ` +
+                `python3 with Pillow is not available in this OpenCode environment, so image_read ran in header-only mode: ` +
                 `no pixels are attached and no resizing happens.\n${note}\n` +
                 `Install python3 with Pillow and tesseract for full image reading (dimensions, downscaling, PDF, attachment), then restart OpenCode.`,
               metadata: { image: true, fallback: true, attached: false, ocr, max },

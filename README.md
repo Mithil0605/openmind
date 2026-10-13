@@ -389,6 +389,6 @@ npm test
 npm pack
 ```
 
-`npm test` runs ESLint, a syntax check, and the twelve suites in `test/`. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
+`npm test` runs ESLint, a syntax check, and the twelve suites in `test/`. The `image` suite drives the real Python helper, so it needs `python3` with Pillow and uses `tesseract` and a PDF rasterizer (`pdftoppm`/`mutool`/`gs`) when they are installed; everything else runs on a bare Node install. CI installs those optional packages so the full feature path is exercised on every push. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
 
 `install.mjs` accepts `--commands global` (default), `--commands project`, or `--commands none` to control where the slash commands go.
