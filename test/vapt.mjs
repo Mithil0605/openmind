@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const exec = promisify(execFile);
 const directory = await mkdtemp(join(tmpdir(), "openmind-vapt-test-"));
@@ -123,7 +123,7 @@ try {
   const secureCtx = context();
   secureCtx.directory = secure;
   secureCtx.worktree = secure;
-  const seed = `import plugin from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
+  const seed = `import { MemoryPlugin as plugin } from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
 const d = ${JSON.stringify(secure)};
 const c = { directory: d, worktree: d };
 (async () => {
@@ -132,7 +132,7 @@ const c = { directory: d, worktree: d };
   await h.tool.memory_remember.execute({ text: "SECRET-CLASSIFIED-993", scope: "project" }, c);
 })()`;
   await exec(process.execPath, ["--input-type=module", "-e", seed]);
-  const probe = `import plugin from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
+  const probe = `import { MemoryPlugin as plugin } from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
 const d = ${JSON.stringify(secure)};
 const c = { directory: d, worktree: d };
 (async () => {
@@ -150,7 +150,7 @@ const c = { directory: d, worktree: d };
   // -------------------------------------------------------------------------
   const xproc = join(directory, "xproc");
   await mkdir(xproc, { recursive: true });
-  const writer = `import plugin from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
+  const writer = `import { MemoryPlugin as plugin } from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
 const d = ${JSON.stringify(xproc)};
 const c = { directory: d, worktree: d };
 (async () => {

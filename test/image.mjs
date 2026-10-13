@@ -1,8 +1,8 @@
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { deflateSync } from "node:zlib";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const directory = await mkdtemp(join(tmpdir(), "openmind-image-test-"));
 
@@ -50,6 +50,40 @@ function makePng(width, height, byte = 0x2e) {
     }
   }
   return Buffer.concat([sig, pngChunk("IHDR", ihdr), pngChunk("IDAT", deflateSync(raw)), pngChunk("IEND", Buffer.alloc(0))]);
+}
+
+// A minimal, valid multi-page PDF with real text operators, built by hand so
+// the test needs no PDF library: a rasterizer must be able to open it.
+function makePdf(labels) {
+  const count = labels.length;
+  const fontId = 3 + count * 2;
+  const pageId = (i) => 3 + i * 2;
+  const contentId = (i) => 4 + i * 2;
+  const objects = [];
+  objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+  objects[2] = `<< /Type /Pages /Kids [${labels.map((_, i) => `${pageId(i)} 0 R`).join(" ")}] /Count ${count} >>`;
+  labels.forEach((label, i) => {
+    objects[pageId(i)] =
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] ` +
+      `/Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId(i)} 0 R >>`;
+    const stream = `BT /F1 28 Tf 40 100 Td (${label}) Tj ET`;
+    objects[contentId(i)] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+  });
+  objects[fontId] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
+  let out = "%PDF-1.4\n";
+  const offsets = [];
+  for (let id = 1; id <= objects.length; id += 1) {
+    offsets[id] = out.length;
+    out += `${id} 0 obj\n${objects[id]}\nendobj\n`;
+  }
+  const startxref = out.length;
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let id = 1; id <= objects.length; id += 1) {
+    out += `${String(offsets[id]).padStart(10, "0")} 00000 n \n`;
+  }
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${startxref}\n%%EOF\n`;
+  return Buffer.from(out, "latin1");
 }
 
 function assert(condition, message) {
@@ -131,6 +165,44 @@ try {
   // 11. Relative path resolves against the project directory.
   const rel = await hooks.tool.image_read.execute({ target: "sample.png", ocr: false }, ctx);
   assert(/640x480/.test(String(rel.output || rel)), "relative target did not resolve inside the project");
+
+  // 12. The model must receive the image itself, not only a description of it.
+  //     ToolResult.attachments is the only channel that carries pixels.
+  const attached = await hooks.tool.image_read.execute({ target: png, ocr: false }, ctx);
+  const atts = attached.attachments || [];
+  assert(atts.length === 1, "image_read returned no attachment");
+  assert(atts[0].type === "file" && atts[0].mime === "image/png", "attachment is not a PNG file part");
+  assert(/^data:image\/png;base64,iVBORw0KGgo/.test(atts[0].url), "attachment url is not a PNG data URL");
+  assert(attached.metadata?.attached === true, "attachment was not reported in metadata");
+  assert(/\[attach\]/.test(String(attached.output)), "attachment was not explained in the text output");
+
+  // 13. attach:false must still work and must say the image was not attached.
+  const noAttach = await hooks.tool.image_read.execute({ target: png, ocr: false, attach: false }, ctx);
+  assert((noAttach.attachments || []).length === 0, "attach:false still attached an image");
+  assert(/attach:false|attach was disabled/.test(String(noAttach.output)), "attach:false did not explain itself");
+  assert(/640x480/.test(String(noAttach.output)), "attach:false lost the metadata");
+
+  // 14. PDFs are rasterized, not refused with a dead-end hint.
+  const pdfPath = join(directory, "doc.pdf");
+  await writeFile(pdfPath, makePdf(["ALPHA", "BETA"]));
+  const pdfOut = await hooks.tool.image_read.execute({ target: pdfPath, pages: 2 }, ctx);
+  const pdfText = String(pdfOut.output || pdfOut);
+  assert(/\[type\] PDF \(document\)/.test(pdfText), "PDF was not recognized as a document");
+  const rasterized = /PDF page 1\/2/.test(pdfText) && /\[raster\] \d+x\d+/.test(pdfText);
+  if (/rasterization needs one of/.test(pdfText)) {
+    assert(/pdftoppm/.test(pdfText), "missing-PDF hint does not name a rasterizer");
+  } else {
+    assert(rasterized, "PDF pages were not rasterized");
+    assert(/\[ocr\]/.test(pdfText), "rasterized PDF pages were not OCR'd");
+    assert((pdfOut.attachments || []).length === 1, "rasterized PDF page 1 was not attached");
+  }
+  // The emitted temp PNG must not be left behind in the temp dir.
+  const leftovers = (await readdir(tmpdir())).filter((name) => name.startsWith(`openmind-img-${process.pid}-`));
+  assert(leftovers.length === 0, `image_read leaked ${leftovers.length} temp attachment file(s)`);
+
+  // 15. A single PDF page by default: pages must not be fetched implicitly.
+  const onePage = await hooks.tool.image_read.execute({ target: pdfPath }, ctx);
+  assert(/PDF page 1\/1/.test(String(onePage.output || onePage)), "default PDF page count is not 1");
 
   console.log("image tests passed");
 } finally {

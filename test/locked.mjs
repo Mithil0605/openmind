@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const exec = promisify(execFile);
 const directory = await mkdtemp(join(tmpdir(), "opencode-memory-locked-"));
@@ -23,7 +23,7 @@ function context() {
 
 try {
   const entry = new URL("../index.js", import.meta.url).pathname;
-  const creator = `import plugin from ${JSON.stringify(entry)};
+  const creator = `import { MemoryPlugin as plugin } from ${JSON.stringify(entry)};
 const d = ${JSON.stringify(directory)};
 (async () => {
   const hooks = await plugin({ directory: d, worktree: d }, { directory: d });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,16 @@ const root = dirname(fileURLToPath(import.meta.url));
 const isWindows = process.platform === "win32";
 const extraBin = join(homedir(), ".opencode", "bin");
 process.env.PATH = extraBin + delimiter + (process.env.PATH || "");
+
+// `--commands project` installs into <cwd>/.opencode/commands instead of the
+// global config dir; `none` skips them.
+const commandMode = (() => {
+  const flag = process.argv.find((arg) => arg.startsWith("--commands"));
+  if (flag && flag.includes("=")) return flag.split("=")[1].trim();
+  const index = process.argv.indexOf("--commands");
+  if (index !== -1 && process.argv[index + 1]) return process.argv[index + 1].trim();
+  return "global";
+})();
 
 function command(name) {
   return isWindows ? name + ".cmd" : name;
@@ -60,9 +70,45 @@ console.log("Registering plugin with OpenCode...");
 const register = run("opencode", ["plugin", root, "--global", "--force"]);
 if (register.status !== 0) fail("OpenCode plugin registration failed. Check the messages above, then run setup again.");
 
+// Slash commands (/listen, /imgread) ship with the package. Without this step the
+// README advertised commands that no install ever delivered.
+// OpenCode scans both `command/` and `commands/` under a config directory.
+function configDir() {
+  if (process.env.OPENCODE_CONFIG_DIR) return resolve(process.env.OPENCODE_CONFIG_DIR);
+  const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  return join(base, "opencode");
+}
+
+if (commandMode !== "none") {
+  const source = join(root, "commands");
+  if (!existsSync(source)) {
+    console.log("SKIP slash commands: the package has no commands/ directory.");
+  } else {
+    const target =
+      commandMode === "project"
+        ? join(process.cwd(), ".opencode", "commands")
+        : join(configDir(), "commands");
+    try {
+      mkdirSync(target, { recursive: true });
+      let copied = 0;
+      for (const entry of readdirSync(source)) {
+        if (!entry.endsWith(".md")) continue;
+        copyFileSync(join(source, entry), join(target, entry));
+        copied += 1;
+      }
+      console.log(`OK ${copied} slash command(s) installed to ${target}`);
+    } catch (err) {
+      console.log("WARN slash commands could not be installed: " + String(err.message || err));
+      console.log("     Copy the files in " + source + " into .opencode/commands/ by hand.");
+    }
+  }
+}
+
 console.log("\nSetup complete.");
 console.log("Restart OpenCode, then try:");
 console.log("  Remember for this project that I prefer short answers.");
 console.log("  What do you remember about this project?");
+console.log("  /listen https://example.com");
+console.log("  /imgread screenshot.png");
 console.log("\nOpenMind v5 does not save session data. Durable memory is opt-in, project-scoped, and can be deleted at any time.");
 console.log("Memory file location can be changed later with OPENCODE_MEMORY_DIR.");

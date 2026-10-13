@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const exec = promisify(execFile);
 const directory = await mkdtemp(join(tmpdir(), "opencode-memory-sec-"));
@@ -118,7 +118,7 @@ try {
   // 7. Locked encrypted store must not disclose contents.
   const lockedDir = join(directory, "locked");
   await mkdir(lockedDir, { recursive: true });
-  const creator = `import plugin from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
+  const creator = `import { MemoryPlugin as plugin } from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
 const d = ${JSON.stringify(lockedDir)};
 (async () => {
   const h = await plugin({ directory: d, worktree: d }, { directory: d });
@@ -150,7 +150,7 @@ const d = ${JSON.stringify(lockedDir)};
   // 9. Cross-process concurrent writes never corrupt the file format.
   const xproc = join(directory, "xproc");
   await mkdir(xproc, { recursive: true });
-  const writer = `import plugin from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
+  const writer = `import { MemoryPlugin as plugin } from ${JSON.stringify(new URL("../index.js", import.meta.url).pathname)};
 const d = ${JSON.stringify(xproc)};
 const c = { directory: d, worktree: d };
 (async () => {

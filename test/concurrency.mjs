@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const directory = await mkdtemp(join(tmpdir(), "opencode-memory-conc-"));
 

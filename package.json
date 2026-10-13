@@ -1,8 +1,8 @@
 {
   "name": "openmind-v5",
-  "version": "5.0.0",
+  "version": "5.2.0",
   "type": "module",
-  "description": "Privacy-first, user-controlled memory tools for OpenCode — with web listening/analysis, image reading and OCR — optional AES-256-GCM encryption, no session persistence, and atomic writes.",
+  "description": "Privacy-first, user-controlled memory tools for OpenCode V2 — project-scoped BM25 recall, SSRF-hardened web listening, image/PDF reading with OCR, and optional AES-256-GCM encryption. No session persistence.",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
@@ -10,34 +10,42 @@
   "files": [
     "index.js",
     "lib/imgread.py",
+    "commands",
     "install.mjs",
     "install.sh",
     "install.ps1",
     "install.cmd",
     "README.md",
     "SETUP.md",
+    "ARCHITECTURE.md",
     "LICENSE"
   ],
   "scripts": {
     "lint": "eslint .",
-    "test:unit": "node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs",
+    "test:unit": "node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/store.mjs && node test/ranking.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs && node test/vapt2.mjs",
     "test": "npm run lint && node --check index.js && npm run test:unit",
     "pack:local": "npm pack",
     "setup": "node install.mjs"
   },
   "keywords": [
     "opencode",
+    "opencode-plugin",
     "plugin",
     "openmind",
+    "memory",
     "privacy",
+    "ssrf",
     "image",
     "ocr",
+    "pdf",
     "web",
     "listen",
     "scraping",
     "analysis",
+    "aes-256-gcm",
     "windows",
-    "linux"
+    "linux",
+    "macos"
   ],
   "license": "MIT",
   "publishConfig": {
@@ -48,7 +56,7 @@
     "url": "git+https://github.com/Mithil0605/openmind.git"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.18"
+    "@opencode-ai/plugin": "1.18.33"
   },
   "engines": {
     "node": ">=22"

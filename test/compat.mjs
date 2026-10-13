@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const dir = await mkdtemp(join(tmpdir(), "openmind-compat-"));
 function ctx(d = dir) { return { sessionID: "compat", messageID: "m", agent: "a", directory: d, worktree: d, abort: new AbortController().signal, metadata() {}, ask() {} }; }

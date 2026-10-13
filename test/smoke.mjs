@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import plugin from "../index.js";
+import { MemoryPlugin as plugin } from "../index.js";
 
 const directory = await mkdtemp(join(tmpdir(), "opencode-memory-test-"));
 
@@ -34,7 +34,8 @@ try {
 
   const output = { system: [] };
   await hooks["experimental.chat.system.transform"]({ sessionID: "smoke-session", model: {} }, output);
-  if (!output.system.join("\n").includes("OpenMind saved preferences")) throw new Error("memory block was not injected");
+  if (!output.system.join("\n").includes("portable OpenCode plugin")) throw new Error("memory block was not injected");
+  if (!output.system.join("\n").includes("<openmind-memories>")) throw new Error("memory block is not delimited");
 
   const exported = await hooks.tool.memory_export.execute({ scope: "visible" }, context);
   if (!String(exported.output).includes("portable OpenCode plugin")) throw new Error("memory_export did not include saved memory");
@@ -99,7 +100,7 @@ try {
     await budgeted["experimental.chat.system.transform"]({ sessionID: "budget", model: {} }, { system });
     const block = system.join("\n");
 
-    if (!block.includes("OpenMind saved preferences")) throw new Error("budget test: nothing was injected");
+    if (!block.includes("<openmind-memories>")) throw new Error("budget test: nothing was injected");
     if (!block.includes("short preference 0")) throw new Error("budget test: short memories were crowded out");
     const longestRun = Math.max(0, ...(block.match(/O+/g) || []).map((run) => run.length));
     if (longestRun > 450) throw new Error(`budget test: 8000-char memory injected as a ${longestRun}-char run`);

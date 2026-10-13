@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import plugin, { buildAnalysis } from "../index.js";
+import { MemoryPlugin as plugin, buildAnalysis, parseRobots, robotsPathAllowed } from "../index.js";
 
 const directory = await mkdtemp(join(tmpdir(), "openmind-listen-test-"));
 
@@ -212,6 +212,88 @@ try {
   assert(/blocked|private|loopback/i.test(String(edge2.output || edge2)), "port scan on loopback not blocked");
 
   console.log("    Edge cases: PASS");
+
+  // =========================================================================
+  // PART 6: robots.txt parsing and matching
+  // =========================================================================
+  console.log("  robots.txt tests...");
+
+  const wildcard = parseRobots(`
+# comment line
+User-agent: *
+Disallow: /private/
+Disallow: /*.json$
+Allow: /private/public.html
+`);
+  assert(robotsPathAllowed(wildcard, "/"), "root path wrongly disallowed");
+  assert(!robotsPathAllowed(wildcard, "/private/secret"), "Disallow prefix ignored");
+  assert(robotsPathAllowed(wildcard, "/private/public.html"), "Allow did not win over a shorter Disallow");
+  assert(!robotsPathAllowed(wildcard, "/data.json"), "$ anchored wildcard pattern ignored");
+  assert(robotsPathAllowed(wildcard, "/data.jsonl"), "$ anchored pattern matched too eagerly");
+
+  // A named group must win over the wildcard group, so the wildcard rules above do
+  // not apply once OpenMind has a group of its own.
+  const named = parseRobots(`
+User-agent: *
+Disallow: /
+
+User-agent: OpenMind-Listen
+Disallow: /nope
+`);
+  assert(robotsPathAllowed(named, "/private/secret"), "the wildcard group was merged into the named group");
+  assert(!robotsPathAllowed(named, "/nope"), "named user-agent group ignored");
+  assert(robotsPathAllowed(named, "/pricing"), "named group over-blocked a normal path");
+
+  // "Disallow:" with no value means allow everything.
+  const empty = parseRobots("User-agent: *\nDisallow:\n");
+  assert(robotsPathAllowed(empty, "/secret"), "an empty Disallow was treated as a block");
+
+  // Lines without a colon and malformed rules must not throw.
+  assert(Array.isArray(parseRobots("garbage\n:::\nUser-agent\n")), "malformed robots.txt did not parse");
+
+  console.log("    robots: PASS");
+
+  // =========================================================================
+  // PART 7: depth and output bounds
+  // =========================================================================
+  console.log("  Depth and output tests...");
+
+  const quick = buildAnalysis("https://example.com/", SAMPLE_HTML, { "content-type": "text/html" }, { depth: "quick" });
+  assert(quick.includes("**Title:** Test Page - OpenMind Listen"), "quick depth dropped the metadata");
+  assert(/Welcome to Test Page/.test(quick), "quick depth dropped the visible text");
+  // Metadata (including Open Graph) and text stay; the structural passes go.
+  assert(/## Open Graph Data/.test(quick), "quick depth dropped Open Graph metadata");
+  for (const section of ["## Page Structure", "## Links", "## Images", "## Code Snippets", "## Tables", "## Lists"]) {
+    assert(!quick.includes(section), `quick depth still rendered ${section}`);
+  }
+  assert(!quick.includes("https://example.com/link1"), "quick depth still rendered the link list");
+  assert(!quick.includes("| Name | Value |"), "quick depth still rendered tables");
+  assert(quick.length < analysis.length, "quick depth produced a report no smaller than full");
+
+  // full depth must still include everything quick omits.
+  assert(analysis.includes("https://example.com/link1"), "full depth lost links");
+
+  // The report is hard-capped no matter how large the page is: ten large code
+  // blocks alone blow past the per-section caps.
+  const huge = buildAnalysis(
+    "https://example.com/",
+    `<html><body>${`<pre><code>${"const value = compute(1234); // padding line\n".repeat(60)}</code></pre>`.repeat(10)}</body></html>`,
+    { "content-type": "text/html" },
+  );
+  assert(huge.length < 30000, `report was not capped (${huge.length} chars)`);
+  assert(/\[truncated\]/.test(huge), "truncation was not announced");
+
+  // A page that is merely large must still be reported in full, because the
+  // per-section caps (not the final ceiling) are what bound it.
+  const big = buildAnalysis(
+    "https://example.com/",
+    `<html><body>${"<p>lorem ipsum dolor sit amet</p>".repeat(20000)}</body></html>`,
+    { "content-type": "text/html" },
+  );
+  assert(!/\[truncated\]/.test(big), "a text-only page was reported as truncated");
+  assert(big.length < 30000, `text-only page report was not bounded (${big.length} chars)`);
+
+  console.log("    Depth and output: PASS");
 
   console.log("listen: all tests passed");
 } finally {

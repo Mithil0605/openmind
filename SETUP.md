@@ -28,6 +28,14 @@ sh ./install.sh
 
 Then restart OpenCode.
 
+## What Setup Does
+
+- installs the plugin's own dependency,
+- registers the plugin with OpenCode globally,
+- copies the `/listen` and `/imgread` slash commands into your OpenCode config directory (`commands/`).
+
+Setup needs OpenCode and Node.js 22 or newer. It never uploads anything.
+
 ## Check That It Works
 
 In OpenCode, type:
@@ -36,6 +44,23 @@ In OpenCode, type:
 Remember for this project that I prefer short answers.
 What do you remember about this project?
 ```
+
+Then try the slash commands:
+
+```text
+/listen https://example.com
+/imgread path/to/screenshot.png
+```
+
+## Optional Extras
+
+Image reading and PDF support get better with these, all optional:
+
+- `python3` with Pillow — image resizing, URL downloads, SVG/PDF handling
+- `tesseract` — OCR text
+- `poppler-utils`, `mupdf-tools`, or `ghostscript` — PDF rasterization
+
+Without them `image_read` still reports format and dimensions, and says clearly what is missing.
 
 ## Privacy and Deletion
 
