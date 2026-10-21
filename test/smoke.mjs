@@ -183,7 +183,7 @@ try {
     await orphanHooks["experimental.chat.system.transform"]({ sessionID: "orphan", model: {} }, { system });
     if (!system.join("\n").includes("legacy preference 0")) throw new Error("orphan test: orphans still not injected");
 
-    if (!String(await orphanHooks.tool.memory_reassign.execute({}, orphanCtx)).includes("No orphaned memories")) {
+    if (!String(await orphanHooks.tool.memory_reassign.execute({}, orphanCtx)).includes("No stranded memories")) {
       throw new Error("orphan test: a second pass should find nothing left to reassign");
     }
   } finally {

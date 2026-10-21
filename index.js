@@ -1431,6 +1431,32 @@ function compactProject(path) {
   return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
 }
 
+// A project key is normally an absolute path. Namespaced keys ("ns:...") and
+// other opaque identifiers are not paths and are never treated as missing.
+function looksLikeProjectPath(value) {
+  return (
+    typeof value === "string" &&
+    (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\"))
+  );
+}
+
+// The filesystem root is never a real project directory: a memory recorded
+// against it was written by a session whose project could not be resolved.
+function isFilesystemRoot(value) {
+  return value === "/" || /^[A-Za-z]:[\\/]?$/.test(value);
+}
+
+// A project directory that no longer exists means the project was renamed,
+// moved or deleted, so the memories recorded against it are orphans. A
+// directory that still exists belongs to a live project: rebinding its
+// memories would take them away from that project, so those are only
+// rebindable one by one, by explicit id.
+function projectDirectoryMissing(project) {
+  if (!looksLikeProjectPath(project)) return false;
+  if (isFilesystemRoot(project)) return true;
+  return !existsSync(project);
+}
+
 // Visibility takes the already-resolved project key rather than a context, so
 // the key cannot be recomputed (from a different namespace) behind its back.
 function visibleToProject(memory, key) {
@@ -1615,15 +1641,24 @@ function filterMemories(memories, key, args = {}) {
   // bm25Documents returns both the score and each entry's token set, so negation
   // filtering does not have to re-tokenize every entry a second time.
   const scored = bm25Documents(tagged, positive);
-  return scored
-    .filter((doc) =>
-      negative.every((term) => {
-        if (doc.unique.has(term)) return false;
-        // The index stores both the raw token and its stem, so an exclusion has
-        // to consider both forms too.
-        return !doc.unique.has(stem(term));
-      }),
-    )
+  const kept = scored.filter((doc) =>
+    negative.every((term) => {
+      if (doc.unique.has(term)) return false;
+      // The index stores both the raw token and its stem, so an exclusion has
+      // to consider both forms too.
+      return !doc.unique.has(stem(term));
+    }),
+  );
+  if (positive.length === 0) {
+    // A query made only of negated terms ("-windows") has nothing to rank by:
+    // every BM25 score is zero. The exclusions still apply, so the survivors
+    // are returned ordered by pinned first and recency second.
+    return kept
+      .sort((a, b) => Number(b.entry.pinned) - Number(a.entry.pinned) || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
+      .slice(0, limit)
+      .map(({ entry }) => entry);
+  }
+  return kept
     .filter((doc) => doc.score > 0)
     .map((doc) => ({
       entry: doc.entry,
@@ -2095,11 +2130,20 @@ let startupWarning = "";
           (memory) => visibleToProject(memory, key) && isDuplicate(memory.text, trimmed),
         );
         if (existing) {
-          existing.text = trimmed;
-          existing.tags = [...new Set([...(existing.tags || []), ...tagList])];
-          existing.source = source ?? existing.source;
-          if (pinned !== undefined) existing.pinned = Boolean(pinned);
-          existing.updatedAt = timestamp;
+          // The update path mutates an entry that is already in the vault, so it
+          // has to go through the same sanitizer as the create path: without it
+          // an over-long source or tag survives into the store verbatim, and
+          // both are rendered back to the model at injection time.
+          const merged = sanitizeEntry({
+            ...existing,
+            text: trimmed,
+            tags: [...new Set([...(existing.tags || []), ...tagList])],
+            source: source ?? existing.source,
+            pinned: pinned !== undefined ? Boolean(pinned) : existing.pinned,
+            updatedAt: timestamp,
+          });
+          if (!merged) return { error: "OpenMind: refusing to save an empty memory." };
+          Object.assign(existing, merged);
           outcome = { updated: true, memory: existing };
         }
       }
@@ -2191,20 +2235,30 @@ let startupWarning = "";
                 (entry) => entry.id === args.id && visibleToProject(entry, projectKey(context)),
               );
               if (!memory) return `No visible memory found with id ${args.id}.`;
-              if (args.text !== undefined) memory.text = String(args.text).trim().slice(0, MAX_TEXT_LENGTH);
-              if (args.tags !== undefined) {
-    // The `listen` tag is sticky. It is what marks an entry as web-derived and
-    // therefore untrusted at injection time; if an update could drop it, the
-    // entry would silently lose its UNTRUSTED framing. Re-sanitizing here also
-    // keeps tags within the length limits, so an over-long tag is not silently
-    // re-truncated on the next store load.
-    const requested = asArray(args.tags);
-    const kept = memory.tags?.includes("listen") ? ["listen"] : [];
-    memory.tags = sanitizeEntry({ ...memory, tags: [...new Set([...kept, ...requested])] })?.tags ?? [];
-  }
-              if (args.source !== undefined) memory.source = args.source?.trim() || null;
-              if (args.pinned !== undefined) memory.pinned = Boolean(args.pinned);
-              memory.updatedAt = now();
+              // Every field goes through the sanitizer: an update is a write
+              // path too, and `source`/`tags` are rendered back to the model at
+              // injection time, so an uncapped value must never reach the
+              // store through this route.
+              const updated = sanitizeEntry({
+                ...memory,
+                text: args.text !== undefined ? String(args.text).trim() : memory.text,
+                tags:
+                  args.tags !== undefined
+                    ? (() => {
+                        // The `listen` tag is sticky. It is what marks an entry as web-derived
+                        // and therefore untrusted at injection time; if an update could drop
+                        // it, the entry would silently lose its UNTRUSTED framing.
+                        const requested = asArray(args.tags);
+                        const kept = memory.tags?.includes("listen") ? ["listen"] : [];
+                        return [...new Set([...kept, ...requested])];
+                      })()
+                    : memory.tags,
+                source: args.source !== undefined ? args.source?.trim() || null : memory.source,
+                pinned: args.pinned !== undefined ? Boolean(args.pinned) : memory.pinned,
+                updatedAt: now(),
+              });
+              if (!updated) return `Memory ${args.id} could not be updated: the result would be empty.`;
+              Object.assign(memory, updated);
               await saveVault(file);
               return {
                 title: "Memory updated",
@@ -2467,9 +2521,10 @@ async execute(args, context) {
 
       memory_reassign: tool({
         description:
-          "Re-attach orphaned memories to a project. A memory is orphaned when its recorded project path no longer matches the worktree you are in, which happens whenever a project directory is renamed, moved, or opened from a different path. Orphaned memories cannot be seen, edited, or deleted by memory_recall/list/update/forget/prune, so this tool is the only recovery path. Lists orphans by default; pass confirm to rebind them to the current worktree.",
+          "Re-attach stranded memories to a project. A memory is stranded when it is not owned by the worktree you are in. Two kinds are recovered in bulk: memories whose recorded project directory no longer exists (the project was renamed, moved or deleted), and legacy records that belong to no project at all. Memories owned by a different project that still exists are only rebindable one at a time, by naming their ids, so a project can never absorb another live project's memories by accident. Stranded memories cannot be seen, edited, or deleted by memory_recall/list/update/forget/prune, so this tool is the only recovery path. Lists candidates by default; pass confirm to rebind them to the current worktree.",
         args: {
-          ids: tool.schema.array(tool.schema.string()).optional().describe("Orphaned memory IDs to rebind. Defaults to every orphaned memory."),
+          ids: tool.schema.array(tool.schema.string()).optional().describe("Memory IDs to rebind. Defaults to every recoverable orphan."),
+          includeForeign: tool.schema.boolean().optional().describe("Also list memories owned by a project directory that still exists. They are only rebindable by naming their ids explicitly."),
           confirm: tool.schema.boolean().optional().describe("Set true to perform the reassignment. Without it, only a preview is returned."),
         },
         async execute(args, context) {
@@ -2483,24 +2538,62 @@ async execute(args, context) {
 
               // Deliberately does not go through visibleToProject: the whole point
               // is to reach records this project cannot otherwise see.
-              const orphans = vault.entries.filter(
-                (memory) => memory.scope !== "global" && memory.project && memory.project !== current,
+              //
+              // Two kinds of record are not owned by the current project: a
+              // project-scoped memory recorded against another path, and a
+              // legacy record that belongs to no project at all.
+              const foreign = vault.entries.filter(
+                (memory) =>
+                  memory.project !== current && (memory.scope !== "global" || !memory.project),
               );
-            if (orphans.length === 0) return "No orphaned memories: every project memory already belongs to this worktree.";
+            if (foreign.length === 0) return "No stranded memories: every project memory already belongs to this worktree.";
 
-            const targeted = ids.size ? orphans.filter((memory) => ids.has(memory.id)) : orphans;
-            if (targeted.length === 0) return "None of the given ids are orphaned memories.";
+              // Split them: a missing project directory means the project is
+              // gone and its memories are orphans, while a directory that still
+              // exists belongs to a live project whose memories must not be
+              // taken over in bulk.
+              const orphans = [];
+              const live = [];
+              for (const memory of foreign) {
+                if (!memory.project || projectDirectoryMissing(memory.project)) orphans.push(memory);
+                else live.push(memory);
+              }
+
+              // Bulk reassignment only ever covers true orphans. A live
+              // project's memories are rebindable only when the caller names
+              // their ids one by one.
+              const targeted = ids.size ? foreign.filter((memory) => ids.has(memory.id)) : orphans;
+              if (ids.size && targeted.length === 0) {
+                return "None of the given ids are stranded memories.";
+              }
 
             if (args.confirm !== true) {
+              const listed = args.includeForeign ? [...orphans, ...live] : orphans;
+              if (listed.length === 0) {
+                return live.length
+                  ? `No orphaned memories to rebind. ${live.length} memory item(s) are owned by a project that still exists; pass includeForeign: true to review them and name their ids to rebind them.`
+                  : "No orphaned memories to rebind: every stranded memory already belongs to this worktree.";
+              }
+              const liveNote =
+                live.length === 0
+                  ? ""
+                  : args.includeForeign
+                    ? `\n\n${live.length} of the item(s) above are owned by a project that still exists. They are only rebindable by naming their ids explicitly (ids: [...]).`
+                    : `\n\n${live.length} more memory item(s) are owned by a project that still exists and are not listed here. Pass includeForeign: true to review them, and name their ids explicitly to rebind them.`;
               return {
                 title: "Orphaned memories",
                 output:
-                  `${orphans.length} memory item(s) are attached to a project path that is not the current worktree.\n` +
+                  `${listed.length} memory item(s) can be rebound to the current worktree.\n` +
                   `Current worktree project: ${current}\n\n` +
-                  `${orphans.map(formatMemory).join("\n")}\n\n` +
-                  `Set confirm: true (optionally with ids: [...]) to rebind them to ${current}.`,
-                metadata: { count: orphans.length, current },
+                  `${listed.map(formatMemory).join("\n")}\n\n` +
+                  `Set confirm: true (optionally with ids: [...]) to rebind them to ${current}.` +
+                  liveNote,
+                metadata: { count: listed.length, current, live: live.length },
               };
+            }
+
+            if (targeted.length === 0) {
+              return "No orphaned memories to rebind. Every stranded memory belongs to a project that still exists; name their ids explicitly to rebind them.";
             }
 
             const targetedIDs = new Set(targeted.map((memory) => memory.id));
@@ -2508,12 +2601,15 @@ async execute(args, context) {
             for (const memory of vault.entries) {
               if (!targetedIDs.has(memory.id)) continue;
               memory.project = current;
+              // A legacy global record has no project owner; adopting it turns
+              // it into an ordinary project-scoped memory.
+              if (memory.scope === "global") memory.scope = "project";
               memory.updatedAt = timestamp;
             }
             await saveVault(file);
             return {
               title: "Memories reassigned",
-              output: `Rebound ${targeted.length} orphaned memory item(s) to ${current}. They are now visible to this worktree.`,
+              output: `Rebound ${targeted.length} stranded memory item(s) to ${current}. They are now visible to this worktree.`,
               metadata: { count: targeted.length, current, file, encrypted: vault.encrypted },
             };
             }),
@@ -2524,7 +2620,7 @@ async execute(args, context) {
       memory_export: tool({
         description: "Show the memory store location and export project memories as JSON.",
         args: {
-          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default (current worktree only); all includes project memories from every worktree."),
+          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default (current worktree only); all includes every record in the store, including legacy global-scope entries that no project can see."),
         },
         async execute(args, context) {
           return guarded(() =>
@@ -2532,14 +2628,23 @@ async execute(args, context) {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
               if (vault.mode === "locked") return LOCK_MSG;
+              // "all" means all: the legacy global-scope records are invisible
+              // to every project, so dropping them here would make them
+              // unreachable and unrecoverable. They are counted separately so
+              // the caller can tell them apart.
               const exported =
                 args.scope === "all"
-                  ? vault.entries.filter((memory) => memory.scope !== "global")
+                  ? vault.entries
                   : vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
+              const legacyGlobal = exported.filter((memory) => memory.scope === "global").length;
               return {
                 title: "Memory export",
-                output: JSON.stringify({ file, encrypted: vault.encrypted, count: exported.length, memories: exported }, null, 2),
-                metadata: { file, count: exported.length },
+                output: JSON.stringify(
+                  { file, encrypted: vault.encrypted, count: exported.length, legacyGlobal, memories: exported },
+                  null,
+                  2,
+                ),
+                metadata: { file, count: exported.length, legacyGlobal },
               };
             }),
           );
@@ -2754,10 +2859,17 @@ async execute(args, context) {
       // Pinned first, then relevance to what the user just asked, then recency.
       // Scoring is computed inside the guard so ordering cannot interleave with a
       // concurrent writer mid-sort.
+      //
+      // The project key must be the one the session actually belongs to. The
+      // tool path resolves it per session (see directoryFor in the V2 setup);
+      // the hook input carries no directory of its own, so the caller passes
+      // the resolved one in. Falling back to the plugin instance location is
+      // only correct when the session and the plugin instance share a
+      // directory - a moved session or a worktree session does not.
       const context = {
         sessionID: input.sessionID,
-        directory: _input.directory,
-        worktree: _input.worktree,
+        directory: input.directory ?? _input.directory,
+        worktree: input.worktree ?? _input.worktree,
       };
       const lastUserMessageText = lastUserText(output.messages);
       const memories = await withLock(async () => {
@@ -2792,24 +2904,44 @@ export default {
   id: "openmind",
   async setup(ctx) {
     const directory = ctx?.location?.directory;
+    // The project this plugin instance was loaded for. OpenCode loads a plugin
+    // per location, so this is the project the instance serves, and its id is
+    // stable across worktrees and directory moves.
+    const instanceProject = ctx?.location?.project || null;
+    const instanceProjectID = instanceProject?.id || null;
+    const instanceProjectDirectory = instanceProject?.directory || directory;
     const core = await MemoryPlugin({ directory, worktree: directory }, ctx?.options || {});
 
-    // Resolve the project directory for a session. The V2 tool context carries
-    // only the session id, so the session's own location is authoritative; the
-    // plugin's load location is the fallback.
-    const dirCache = new Map();
-    const directoryFor = async (sessionID) => {
+    // Resolve the project directory for a session.
+    //
+    // Reads (injection) and writes (tools) have to use the same key, and that
+    // key must not be something the session can change on its own: OpenCode
+    // can move a session into another project, and the agent driving the
+    // session can ask for that. The session's own location is therefore only
+    // trusted while the session still belongs to this instance's project.
+    // Once it does not, this instance's project is used instead, so a moved
+    // session cannot read or write another project's memories.
+    //
+    // The lookup is deliberately not cached. It is an in-process read that
+    // costs a fraction of a millisecond, while a cached entry would keep
+    // serving the previous project after a move - exactly the window in which
+    // a moved session would see the wrong memories.
+    const projectDirectoryFor = async (sessionID) => {
       if (!sessionID) return directory;
-      if (dirCache.has(sessionID)) return dirCache.get(sessionID);
-      let resolved = directory;
+      let info = null;
       try {
-        const info = await ctx.session.get({ sessionID });
-        resolved = info?.location?.directory || directory;
+        info = await ctx.session?.get?.({ sessionID });
       } catch {
-        // Keep the fallback location when the session cannot be read.
+        // Keep the plugin instance location when the session cannot be read.
+        return directory;
       }
-      dirCache.set(sessionID, resolved);
-      return resolved;
+      const sessionProjectID = info?.projectID;
+      if (instanceProjectID && sessionProjectID && sessionProjectID !== instanceProjectID) {
+        // The session was moved into a different project (or the event came
+        // from one). Stay on this instance's project.
+        return instanceProjectDirectory;
+      }
+      return info?.location?.directory || directory;
     };
 
     await ctx.tool.transform((editor) => {
@@ -2819,7 +2951,7 @@ export default {
           description: definition.description,
           input: definition.input,
           execute: async (input, toolCtx) => {
-            const sessionDirectory = await directoryFor(toolCtx?.sessionID);
+            const sessionDirectory = await projectDirectoryFor(toolCtx?.sessionID);
             const context = {
               sessionID: toolCtx?.sessionID,
               agent: toolCtx?.agent,
@@ -2844,7 +2976,22 @@ export default {
 
     await ctx.session.hook("context", async (event) => {
       const output = { system: [], messages: event.messages };
-      await core["experimental.chat.system.transform"]({ sessionID: event.sessionID, model: {} }, output);
+      // The session's own directory is authoritative for the project key: the
+      // plugin instance location is the directory this instance was loaded for,
+      // which is not necessarily the directory the session lives in (a session
+      // can be moved, or belong to a worktree). Resolving it here keeps
+      // injection on the same key the tool path writes to, so a memory saved
+      // through the tools is actually injected back.
+      const sessionDirectory = await projectDirectoryFor(event.sessionID);
+      await core["experimental.chat.system.transform"](
+        {
+          sessionID: event.sessionID,
+          model: {},
+          directory: sessionDirectory,
+          worktree: sessionDirectory,
+        },
+        output,
+      );
       for (const part of output.system) {
         event.system.push(typeof part === "string" ? { type: "text", text: part } : part);
       }
