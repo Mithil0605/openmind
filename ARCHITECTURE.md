@@ -51,8 +51,14 @@ the plugin is the source you read.
   `{ title, output, metadata, attachments }` result becomes the V2
   `{ content, metadata }` shape (`toToolResult`).
 - **Project resolution** — V2 tool context carries only a `sessionID`, so
-  `directoryFor(sessionID)` resolves the session's own directory via
-  `ctx.session.get(...)` (cached), falling back to the plugin load directory.
+  `projectDirectoryFor(sessionID)` resolves the session's own directory via
+  `ctx.session.get(...)`, falling back to the plugin instance's location. The
+  session's location is only trusted while the session still belongs to this
+  instance's project (`ctx.location.project.id`): a session that was moved
+  into another project keeps this instance's project, so it can neither read
+  nor write that project's memories. The lookup is not cached - it is an
+  in-process read, and a cached entry would keep serving the previous
+  project after a move.
 - **Memory injection** — `ctx.session.hook("context", …)` calls the shared
   `experimental.chat.system.transform` handler and pushes the rendered memory
   block (and any startup warning) onto `event.system`.
@@ -81,7 +87,7 @@ config shows a **path** entry rather than a package name.
 | `memory_forget` | delete one memory by id |
 | `memory_prune` | preview then delete by id, text, or tag |
 | `memory_delete_store` | delete all memories and the store file |
-| `memory_reassign` | rebind memories orphaned by a move/rename |
+| `memory_reassign` | rebind stranded memories (orphans in bulk, a live project's only by explicit id) |
 | `memory_export` | inspect/export visible (or all) memories |
 | `image_read` | attach an image/PDF plus OCR text |
 | `listen_analyze` | fetch and analyze one public page |

@@ -35,17 +35,28 @@ function context(directory, sessionID = "regression-session") {
 
 // A minimal stand-in for the OpenCode V2 plugin context: it records the
 // registered tools and session hooks so the test can drive the real V2 path.
-function v2Context({ location, options, sessions }) {
+//
+// A session is either a directory or { directory, projectID }. The project id
+// is what OpenCode uses to tell projects apart; two projects can share a
+// directory, and a session can be moved from one project to another.
+function v2Context({ location, options, sessions, projectID }) {
   const tools = new Map();
   const hooks = new Map();
   return {
-    location: { directory: location },
+    location: {
+      directory: location,
+      project: { id: projectID || null, directory: location, canonical: location },
+    },
     options: options || {},
     session: {
       async get({ sessionID }) {
-        const directory = sessions[sessionID];
-        if (!directory) throw new Error(`unknown session ${sessionID}`);
-        return { location: { directory } };
+        const entry = sessions[sessionID];
+        if (!entry) throw new Error(`unknown session ${sessionID}`);
+        const resolved = typeof entry === "string" ? { directory: entry } : entry;
+        return {
+          projectID: resolved.projectID === undefined ? projectID : resolved.projectID,
+          location: { directory: resolved.directory },
+        };
       },
       async hook(name, callback) {
         hooks.set(name, callback);
@@ -283,6 +294,53 @@ function systemText(event) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. The review list must not dump a live project's memories in full, and a
+//     preview must describe exactly what the matching confirm will do.
+// ---------------------------------------------------------------------------
+{
+  const root = await mkdtemp(join(tmpdir(), "openmind-v6-review-"));
+  try {
+    const dirA = join(root, "project-a");
+    const dirB = join(root, "project-b");
+    await mkdir(dirA, { recursive: true });
+    await mkdir(dirB, { recursive: true });
+
+    const hooks = await plugin({ directory: dirA, worktree: dirA }, { directory: dirA });
+    const secret = `confidential-${"S".repeat(400)}-tail`;
+    await hooks.tool.memory_remember.execute({ text: secret }, context(dirB, "b"));
+
+    const review = await hooks.tool.memory_reassign.execute({ includeForeign: true }, context(dirA, "a"));
+    const output = String(review.output);
+    assert(
+      !output.includes(secret),
+      "the review list rendered a live project's memory in full",
+    );
+    assert(output.includes("confidential-"), "the review list did not show any excerpt of the memory");
+    assert(
+      !output.includes("tail"),
+      "the review list rendered the end of a live project's memory",
+    );
+
+    // A preview that names ids reports the selected count, so the preview
+    // always matches the confirm that follows it.
+    const foreignId = output.match(/- ([0-9a-f-]{36})/)?.[1];
+    assert(foreignId, "could not read the id of the live project's memory");
+    const preview = await hooks.tool.memory_reassign.execute({ ids: [foreignId] }, context(dirA, "a"));
+    assert(preview.metadata?.count === 1, "a filtered preview did not report the selected count");
+    const done = await hooks.tool.memory_reassign.execute(
+      { ids: [foreignId], confirm: true },
+      context(dirA, "a"),
+    );
+    assert(
+      done.metadata?.count === preview.metadata?.count,
+      "the confirm moved a different number of memories than the preview showed",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 5. Legacy global-scope records must be reachable and adoptable.
 // ---------------------------------------------------------------------------
 {
@@ -338,4 +396,77 @@ function systemText(event) {
   }
 }
 
-console.log("v6.0 regressions: PASS (session-keyed injection, write-path caps, negation-only recall, reassign ownership, legacy global recovery)");
+// ---------------------------------------------------------------------------
+// 6. A session that was moved into another project must not be able to read
+//    that project's memories.
+//
+//    OpenCode can move a session to another directory, and the agent driving
+//    the session can ask for it. The project key therefore may not be derived
+//    from the session's own location alone: a moved session would otherwise
+//    inherit the other project's memories. The plugin instance's project is
+//    the authority instead.
+// ---------------------------------------------------------------------------
+{
+  const root = await mkdtemp(join(tmpdir(), "openmind-v6-moved-"));
+  try {
+    const storeDir = join(root, "store");
+    const projectA = join(root, "project-a");
+    const projectB = join(root, "project-b");
+    await mkdir(storeDir, { recursive: true });
+    await mkdir(projectA, { recursive: true });
+    await mkdir(projectB, { recursive: true });
+
+    // Project B's memory, written by a session that belongs to project B.
+    const ctxB = v2Context({
+      location: projectB,
+      options: { directory: storeDir },
+      projectID: "project-b-id",
+      sessions: { "session-b": { directory: projectB, projectID: "project-b-id" } },
+    });
+    await pluginModule.setup(ctxB);
+    await ctxB.tools.get("memory_remember").execute(
+      { text: "project B private preference" },
+      { sessionID: "session-b", agent: "a1", messageID: "m1", signal: new AbortController().signal },
+    );
+
+    // Project A's plugin instance. Its session "moved" now lives in project
+    // B's directory, but it still belongs to project A.
+    const ctxA = v2Context({
+      location: projectA,
+      options: { directory: storeDir },
+      projectID: "project-a-id",
+      sessions: {
+        "session-a": { directory: projectA, projectID: "project-a-id" },
+        "moved": { directory: projectB, projectID: "project-b-id" },
+      },
+    });
+    await pluginModule.setup(ctxA);
+
+    const movedEvent = { sessionID: "moved", messages: [], system: [] };
+    await ctxA.hooks.get("context")(movedEvent);
+    assert(
+      !systemText(movedEvent).includes("project B private preference"),
+      "a session moved into another project read that project's memories",
+    );
+
+    // And it cannot write into it either: the memory lands in the session's
+    // own project.
+    await ctxA.tools.get("memory_remember").execute(
+      { text: "written by the moved session" },
+      { sessionID: "moved", agent: "a1", messageID: "m1", signal: new AbortController().signal },
+    );
+    const store = await readStore(join(storeDir, "memories.jsonl"));
+    const written = store.find((item) => item.text === "written by the moved session");
+    assert(written, "the moved session's memory was not stored");
+    assert(
+      written.project === projectA,
+      `the moved session wrote into ${written.project} instead of its own project`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+console.log(
+  "v6.0 regressions: PASS (session-keyed injection, write-path caps, negation-only recall, reassign ownership, legacy global recovery, moved-session isolation)",
+);

@@ -168,8 +168,13 @@ try {
     const preview = await orphanHooks.tool.memory_reassign.execute({}, orphanCtx);
     if (preview.metadata?.count !== 3) throw new Error("orphan test: preview did not find all 3 orphans");
 
+    // A preview that names ids has to describe exactly what the matching
+    // confirm would move: the named records, not the whole orphan set.
     const single = await orphanHooks.tool.memory_reassign.execute({ ids: ["orphan-1"] }, orphanCtx);
-    if (single.metadata?.count !== 3) throw new Error("orphan test: filtered preview lost the total orphan count");
+    if (single.metadata?.count !== 1) throw new Error("orphan test: a filtered preview must report the selected count");
+    if (!String(single.output).includes("legacy preference 1")) {
+      throw new Error("orphan test: a filtered preview must show the selected memory");
+    }
 
     const done = await orphanHooks.tool.memory_reassign.execute({ confirm: true }, orphanCtx);
     if (done.metadata?.count !== 3) throw new Error("orphan test: reassignment did not move all 3");

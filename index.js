@@ -866,6 +866,11 @@ const IMG_HELPER = join(dirname(fileURLToPath(import.meta.url)), "lib", "imgread
 
 const STORE_FILE = "memories.jsonl";
 const MAX_TEXT_LENGTH = 8000;
+
+// How many memories of a live project the reassign preview is allowed to
+// list. The list is a review aid; an unbounded one would put an arbitrary
+// amount of another project's data into the model's context.
+const MAX_REVIEW_ITEMS = 25;
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 5 * 60 * 1000;
 const LOCKOUT_FILE = "lockout.json";
@@ -1677,6 +1682,19 @@ function formatMemory(memory) {
   const pin = memory.pinned ? " pinned" : "";
   const project = memory.scope === "project" ? ` project=${compactProject(memory.project)}` : "";
   return `- ${memory.id}${tags}${pin} (${memory.scope}${project}, ${memory.updatedAt})\n  ${memory.text}`;
+}
+
+// A redacted rendering, used for memories that belong to a project which still
+// exists. Listing them is a review aid, not a recovery step, so their text is
+// not dumped into the tool output in full: an id, the owning project and a
+// short excerpt are enough to tell them apart, and the full text stays behind
+// the id the caller already has to name to move one.
+function formatMemorySummary(memory) {
+  const flat = String(memory.text || "").replace(/\s+/g, " ").trim();
+  const excerpt = flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
+  const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
+  const project = compactProject(memory.project) || "(none)";
+  return `- ${memory.id}${tags} (project=${project}, ${memory.updatedAt})\n  ${excerpt}`;
 }
 
 // Selects which memories get injected under a hard character budget. Each entry
@@ -2521,10 +2539,10 @@ async execute(args, context) {
 
       memory_reassign: tool({
         description:
-          "Re-attach stranded memories to a project. A memory is stranded when it is not owned by the worktree you are in. Two kinds are recovered in bulk: memories whose recorded project directory no longer exists (the project was renamed, moved or deleted), and legacy records that belong to no project at all. Memories owned by a different project that still exists are only rebindable one at a time, by naming their ids, so a project can never absorb another live project's memories by accident. Stranded memories cannot be seen, edited, or deleted by memory_recall/list/update/forget/prune, so this tool is the only recovery path. Lists candidates by default; pass confirm to rebind them to the current worktree.",
+          "Re-attach stranded memories to a project. A memory is stranded when it is not owned by the worktree you are in. Two kinds are recovered in bulk: memories whose recorded project directory no longer exists (the project was renamed, moved or deleted), and legacy records that belong to no project at all. Memories owned by a different project that still exists are never taken over by a bulk rebind; one of them can only be moved by naming its id explicitly. Stranded memories cannot be seen, edited, or deleted by memory_recall/list/update/forget/prune, so this tool is the only recovery path. Lists candidates by default; pass confirm to rebind them to the current worktree.",
         args: {
           ids: tool.schema.array(tool.schema.string()).optional().describe("Memory IDs to rebind. Defaults to every recoverable orphan."),
-          includeForeign: tool.schema.boolean().optional().describe("Also list memories owned by a project directory that still exists. They are only rebindable by naming their ids explicitly."),
+          includeForeign: tool.schema.boolean().optional().describe("Also list memories owned by a project directory that still exists. They are shown for review only, as a short excerpt, and can only be rebound by naming their ids explicitly."),
           confirm: tool.schema.boolean().optional().describe("Set true to perform the reassignment. Without it, only a preview is returned."),
         },
         async execute(args, context) {
@@ -2559,68 +2577,85 @@ async execute(args, context) {
                 else live.push(memory);
               }
 
-              // Bulk reassignment only ever covers true orphans. A live
-              // project's memories are rebindable only when the caller names
-              // their ids one by one.
-              const targeted = ids.size ? foreign.filter((memory) => ids.has(memory.id)) : orphans;
-              if (ids.size && targeted.length === 0) {
+              // One selection, shared by the preview and the confirm, so the
+              // preview always describes exactly what the confirm will do.
+              //
+              // Naming ids selects those records - orphans and live ones
+              // alike, because the caller named them on purpose. Without ids,
+              // a rebind only ever covers true orphans.
+              const selected = ids.size ? foreign.filter((memory) => ids.has(memory.id)) : orphans;
+              if (ids.size && selected.length === 0) {
                 return "None of the given ids are stranded memories.";
               }
 
-            if (args.confirm !== true) {
-              const listed = args.includeForeign ? [...orphans, ...live] : orphans;
-              if (listed.length === 0) {
-                return live.length
-                  ? `No orphaned memories to rebind. ${live.length} memory item(s) are owned by a project that still exists; pass includeForeign: true to review them and name their ids to rebind them.`
-                  : "No orphaned memories to rebind: every stranded memory already belongs to this worktree.";
+              if (args.confirm !== true) {
+                // The preview shows what this exact call would move. Live
+                // records are listed for review only, and their text is
+                // redacted: they belong to a project that still exists.
+                const rebindable = ids.size ? selected : orphans;
+                const review = !ids.size && args.includeForeign ? live : [];
+                if (rebindable.length === 0 && review.length === 0) {
+                  return live.length
+                    ? `No orphaned memories to rebind. ${live.length} memory item(s) are owned by a project that still exists; pass includeForeign: true to review them and name their ids to rebind them.`
+                    : "No orphaned memories to rebind: every stranded memory already belongs to this worktree.";
+                }
+                const shown = review.slice(0, MAX_REVIEW_ITEMS);
+                const reviewNote =
+                  review.length === 0
+                    ? ""
+                    : `\n\nOwned by a project that still exists (review only, text redacted) - these are never taken by a bulk rebind; name an id to move one:\n${shown.map(formatMemorySummary).join("\n")}` +
+                      (review.length > shown.length
+                        ? `\n... and ${review.length - shown.length} more not shown.`
+                        : "");
+                return {
+                  title: ids.size ? "Selected stranded memories" : "Orphaned memories",
+                  output:
+                    `${rebindable.length} memory item(s) can be rebound to the current worktree.\n` +
+                    `Current worktree project: ${current}\n\n` +
+                    `${rebindable.map(formatMemory).join("\n")}\n\n` +
+                    `Set confirm: true (optionally with ids: [...]) to rebind them to ${current}.` +
+                    reviewNote,
+                  metadata: { count: rebindable.length, current, live: live.length },
+                };
               }
-              const liveNote =
-                live.length === 0
-                  ? ""
-                  : args.includeForeign
-                    ? `\n\n${live.length} of the item(s) above are owned by a project that still exists. They are only rebindable by naming their ids explicitly (ids: [...]).`
-                    : `\n\n${live.length} more memory item(s) are owned by a project that still exists and are not listed here. Pass includeForeign: true to review them, and name their ids explicitly to rebind them.`;
+
+              if (selected.length === 0) {
+                return "No orphaned memories to rebind. Every stranded memory belongs to a project that still exists; name their ids explicitly to rebind them.";
+              }
+
+              const targetedIDs = new Set(selected.map((memory) => memory.id));
+              const timestamp = now();
+              for (const memory of vault.entries) {
+                if (!targetedIDs.has(memory.id)) continue;
+                // The record is rewritten through the sanitizer, like every
+                // other write path, so a rebound entry cannot carry a field
+                // the store would not accept.
+                const rebound = sanitizeEntry({
+                  ...memory,
+                  project: current,
+                  // A legacy global record has no project owner; adopting it
+                  // turns it into an ordinary project-scoped memory.
+                  scope: "project",
+                  updatedAt: timestamp,
+                });
+                if (!rebound) continue;
+                Object.assign(memory, rebound);
+              }
+              await saveVault(file);
               return {
-                title: "Orphaned memories",
-                output:
-                  `${listed.length} memory item(s) can be rebound to the current worktree.\n` +
-                  `Current worktree project: ${current}\n\n` +
-                  `${listed.map(formatMemory).join("\n")}\n\n` +
-                  `Set confirm: true (optionally with ids: [...]) to rebind them to ${current}.` +
-                  liveNote,
-                metadata: { count: listed.length, current, live: live.length },
+                title: "Memories reassigned",
+                output: `Rebound ${selected.length} stranded memory item(s) to ${current}. They are now visible to this worktree.`,
+                metadata: { count: selected.length, current, file, encrypted: vault.encrypted },
               };
-            }
-
-            if (targeted.length === 0) {
-              return "No orphaned memories to rebind. Every stranded memory belongs to a project that still exists; name their ids explicitly to rebind them.";
-            }
-
-            const targetedIDs = new Set(targeted.map((memory) => memory.id));
-            const timestamp = now();
-            for (const memory of vault.entries) {
-              if (!targetedIDs.has(memory.id)) continue;
-              memory.project = current;
-              // A legacy global record has no project owner; adopting it turns
-              // it into an ordinary project-scoped memory.
-              if (memory.scope === "global") memory.scope = "project";
-              memory.updatedAt = timestamp;
-            }
-            await saveVault(file);
-            return {
-              title: "Memories reassigned",
-              output: `Rebound ${targeted.length} stranded memory item(s) to ${current}. They are now visible to this worktree.`,
-              metadata: { count: targeted.length, current, file, encrypted: vault.encrypted },
-            };
             }),
           );
         },
       }),
 
       memory_export: tool({
-        description: "Show the memory store location and export project memories as JSON.",
+        description: "Show the memory store location and export stored memories as JSON.",
         args: {
-          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default (current worktree only); all includes every record in the store, including legacy global-scope entries that no project can see."),
+          scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default (current worktree only); all is a full-store view that crosses project boundaries - it includes every project's memories and the legacy global-scope entries that no project can see."),
         },
         async execute(args, context) {
           return guarded(() =>
@@ -2637,10 +2672,24 @@ async execute(args, context) {
                   ? vault.entries
                   : vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
               const legacyGlobal = exported.filter((memory) => memory.scope === "global").length;
+              const crossProject = args.scope === "all";
               return {
                 title: "Memory export",
                 output: JSON.stringify(
-                  { file, encrypted: vault.encrypted, count: exported.length, legacyGlobal, memories: exported },
+                  {
+                    file,
+                    encrypted: vault.encrypted,
+                    scope: crossProject ? "all" : "visible",
+                    ...(crossProject
+                      ? {
+                          warning:
+                            "This export crosses project boundaries: it contains every project's memories, not just the current worktree's.",
+                        }
+                      : {}),
+                    count: exported.length,
+                    legacyGlobal,
+                    memories: exported,
+                  },
                   null,
                   2,
                 ),
@@ -2976,12 +3025,10 @@ export default {
 
     await ctx.session.hook("context", async (event) => {
       const output = { system: [], messages: event.messages };
-      // The session's own directory is authoritative for the project key: the
-      // plugin instance location is the directory this instance was loaded for,
-      // which is not necessarily the directory the session lives in (a session
-      // can be moved, or belong to a worktree). Resolving it here keeps
-      // injection on the same key the tool path writes to, so a memory saved
-      // through the tools is actually injected back.
+      // The project key has to be the one the session's tools write under, or a
+      // memory saved through the tools is never injected back. It is resolved
+      // through the same helper the tool path uses, so both sides agree by
+      // construction.
       const sessionDirectory = await projectDirectoryFor(event.sessionID);
       await core["experimental.chat.system.transform"](
         {
