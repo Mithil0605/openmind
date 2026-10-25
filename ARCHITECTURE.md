@@ -27,12 +27,13 @@ lib/imgread.py        image/PDF/OCR helper (invoked with an argv array, no shell
 commands/             /listen and /imgread slash commands (copied by install.mjs)
 install.mjs           cross-platform setup: deps, plugin registration, commands
 install.sh/.cmd/.ps1  thin launchers around install.mjs
-test/                 12 executable suites (see section 9)
+test/                 14 executable suites (see section 9)
 .github/workflows/    CI: lint + syntax check + the full suite on Node 22 and 24
 ```
 
-There is no build step and no runtime dependency beyond `@opencode-ai/plugin`;
-the plugin is the source you read.
+There is no build step and no runtime dependency: `@opencode-ai/plugin` is a
+development-only type source and is never imported by `index.js`. The plugin is
+the source you read, and `npm install --omit=dev` installs nothing.
 
 ## 3. OpenCode integration
 
@@ -75,20 +76,23 @@ config shows a **path** entry rather than a package name.
 
 ## 4. Tool surface
 
-12 tools, all defined once inside `MemoryPlugin`:
+15 tools, all defined once inside `MemoryPlugin`:
 
 | Tool | Purpose |
 | --- | --- |
 | `memory_remember` | save/update one project memory (near-duplicates dedupe) |
 | `memory_update` | edit text/tags/source/pinned by id |
-| `memory_recall` | BM25 search, `-token` negation, tag filter |
-| `memory_list` | recent memories for this project |
+| `memory_recall` | BM25 search, `-token` negation, tag filter, time window |
+| `memory_list` | recent memories for this project, time window |
+| `memory_tags` | tag inventory with counts, most frequent first |
+| `memory_stats` | store health: path, size, encryption, counts, tags |
 | `memory_unlock` | verify password / enable encryption (5-attempt lockout) |
 | `memory_forget` | delete one memory by id |
 | `memory_prune` | preview then delete by id, text, or tag |
 | `memory_delete_store` | delete all memories and the store file |
 | `memory_reassign` | rebind stranded memories (orphans in bulk, a live project's only by explicit id) |
 | `memory_export` | inspect/export visible (or all) memories |
+| `memory_import` | restore an export: dry-run, re-sanitized, project-scoped |
 | `image_read` | attach an image/PDF plus OCR text |
 | `listen_analyze` | fetch and analyze one public page |
 
@@ -162,10 +166,17 @@ files are parsed and raw bytes are never echoed.
 
 ## 9. Testing and CI
 
-`npm test` runs ESLint, `node --check`, then 12 suites:
+`npm test` runs ESLint, `node --check`, then 14 suites:
 
 `smoke`, `compat`, `encryption`, `locked`, `concurrency`, `store`, `ranking`,
-`security`, `image`, `listen`, `vapt`, `vapt2`.
+`security`, `image`, `listen`, `vapt`, `vapt2`, `regressions`, `v61`.
+
+`regressions` pins the v6.0 correctness fixes (injection keying, write-path
+caps, negation-only recall, reassign ownership, legacy globals, moved-session
+isolation). `v61` covers the v6.1 features and is also the security gate for
+`memory_import`: it asserts the size and entry caps, the sanitizer, the
+project-scoping rules, the id-token rule, and that `onConflict: "overwrite"`
+cannot delete a record owned by another project.
 
 They are executable and hermetic: each creates its own temp store, and the
 network suites run against a loopback test server whose hostname resolves to a

@@ -7,11 +7,11 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
-## Status (as of 6.0.0, commit `8c722aa`)
+## Status (as of 6.1.0)
 
-**Done — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are fixed and
-each one now has a regression test in `test/regressions.mjs`, so the thirteen-suite
-`npm test` gate catches a reintroduction.
+**Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
+fixed and each one now has a regression test in `test/regressions.mjs`, so the
+fourteen-suite `npm test` gate catches a reintroduction.
 
 | Item | Fix |
 |---|---|
@@ -33,27 +33,60 @@ each one now has a regression test in `test/regressions.mjs`, so the thirteen-su
   `scope` and a cross-project `warning` field. It is a recovery/diagnostic escape
   hatch, not the normal migration path.
 
-**Open follow-ups (not in 6.0.0):**
+**Shipped in 6.1.0 — P1 #6 (`memory_import`) and P3 #17/#18 (partially), plus
+features the audit implied but did not list.** All four are agent-facing: they
+answer "what do I actually have in memory, and how do I get it back?".
 
+| Feature | Tool | Why it matters |
+|---|---|---|
+| Store inventory | `memory_stats` | Path, size, encryption state, total/visible/pinned/stranded counts, oldest and newest visible memory, tag histogram. Distinguishes an empty store from a locked one from memories stranded under a stale path, without printing another project's path. |
+| Tag inventory | `memory_tags` | The vocabulary, with counts, most frequent first. Makes `memory_recall({tags})` usable without guessing tag names. |
+| Time windows | `last` / `after` / `before` on `memory_recall` and `memory_list` | "What did I decide last week?" An unparseable bound is an error, never a silently ignored filter (a silently dropped window returns the whole store and looks like a success). |
+| Import / restore | `memory_import` | The inverse of `memory_export`, and the only supported way to restore a backup. Dry-run by default; 8 MB / 5000-entry caps; everything re-sanitized; project-scoped by default. |
+
+Two security decisions in this release are worth recording:
+
+- **`onConflict: "overwrite"` may only replace a record this project owns.** The
+  first implementation keyed replacement off the payload's own `project` field,
+  which is attacker-controlled; importing one crafted entry with another
+  project's id deleted that project's memory. Found by red-team review during
+  this release, reproduced, fixed, and pinned by two tests (one in `test/v61.mjs`,
+  one in the external DAST probe). Foreign ids are now always given a fresh id.
+- **Imported text is untrusted text.** It gets an `imported` tag, and the
+  injection fence now treats `imported` like `listen`: sticky through
+  `memory_update`, and framed as quoted data the model must not obey.
+
+`@opencode-ai/plugin` also moved from `dependencies` to `devDependencies`. It was
+never imported by `index.js`, but it transitively pinned vulnerable `toml`/`zod`
+versions into every user install; `npm audit --omit=dev` is now clean, and
+`npm install --omit=dev` installs nothing at all.
+
+**Open follow-ups (not in 6.0.0):**
 1. **Stable project identity (#7).** Scope is still a raw absolute path. Routing
    the key through `ctx.location.project.id` / `session.projectID` fixes the
    *isolation* question but not the *renaming* one: moving a checkout still
    orphans its memories. This is the highest-value remaining correctness item.
-2. **`memory_import` (#6).** Still the only missing half of export; a cleared store
-   remains unrecoverable without hand-editing JSONL.
+2. **Export size cap.** `memory_export` is still unbounded in output size; with a
+   large store it can exhaust the model's context. Import is capped, export is
+   not. Same class of issue as #8.
 3. **Cross-project visibility.** `memory_export { scope: "all" }` plus an explicit-id
    `memory_reassign` is, together, a two-call primitive for moving another project's
    memory. That is inherent to having any cross-project recovery path; the wording
    now says so instead of claiming it is impossible. A capability model (per-project
    opt-in for cross-project reads) would close it properly.
-4. **Export size cap.** `memory_export` is still unbounded in output size; with a
-   large store it can exhaust the model's context. Same class of issue as #8.
-5. **Namespace orphan recovery.** In namespace mode (`ns:team`) no record looks like
+4. **Namespace orphan recovery.** In namespace mode (`ns:team`) no record looks like
    a filesystem path, so every foreign record is classified live and bulk recovery
    finds nothing. Needs its own notion of "the namespace no longer exists".
-6. **`useSessionProject` is not configurable.** The instance project always wins; a
+5. **`useSessionProject` is not configurable.** The instance project always wins; a
    user who deliberately moves a session to another checkout gets the old project's
    memories. A documented option would make that intentional rather than surprising.
+6. **Injection transparency (#18).** A one-line provenance footer (how many
+   memories were injected, how many the budget dropped) is still missing. It is the
+   cheapest remaining observability win, but it adds noise to every prompt, so it
+   needs a config toggle to be worth shipping.
+7. **FTS5 (#12) is now 6.2 work.** It did not make 6.1: it touches storage, the
+   encrypted-store path, and the BM25 tests at once, and the released features did
+   not need it.
 
 ---
 
@@ -277,7 +310,8 @@ each historical fixture and asserts the v6 result.
 
 | Milestone | Contents | Why first |
 |---|---|---|
-| **v6.0 (correctness)** | P0 #1–#5 + regression tests #20 | The store works; the *feature* does not. Ship the injection fix first — it is the difference between "OpenMind remembers" and "OpenMind saves". |
-| **v6.1 (index)** | P2 #12 (SQLite/FTS5) + P2 #16 (format/migrations) + #17/#18 | Turns recall from O(corpus) rescan to a real index; also gives a natural home for the derived data (#13) and the stats/doctor tooling. |
-| **v6.2 (scope + lifecycle)** | #7 stable project identity, #5 global scope done properly, #8 caps/TTL, #6 import, #9 agent scope | Fixes the family of "which project does this belong to" problems at the root instead of patching the symptom. |
-| **v6.3 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
+| **v6.0 (correctness)** — shipped | P0 #1–#5 + regression tests #20 | The store works; the *feature* does not. Ship the injection fix first — it is the difference between "OpenMind remembers" and "OpenMind saves". |
+| **v6.1 (visibility + restore)** — shipped | #6 `memory_import`, #17 `memory_stats`, tag inventory, time windows, `imported` trust tag | Restores what export could only back up, and answers "what is actually in memory?" without reading the JSONL. |
+| **v6.2 (index)** | P2 #12 (SQLite/FTS5) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
+| **v6.3 (scope + lifecycle)** | #7 stable project identity, #5 global scope done properly, #8 caps/TTL + export cap, #9 agent scope | Fixes the family of "which project does this belong to" problems at the root instead of patching the symptom. |
+| **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

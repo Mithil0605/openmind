@@ -4,7 +4,7 @@ Privacy-first, user-controlled memory tools for **OpenCode V2** on Windows, Linu
 
 > The npm package name is still `openmind-v5` until the registry rename lands (see [V6-ROADMAP.md](./V6-ROADMAP.md)). Local-folder installs are unaffected.
 
-OpenMind installs as a single OpenCode plugin that registers 12 tools and a bounded memory-injection hook. It never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, or the entire backing store.
+OpenMind installs as a single OpenCode plugin that registers 15 tools and a bounded memory-injection hook. It never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, the entire backing store, or restore a previous export.
 
 The store can be encrypted with AES-256-GCM. A password is verified like `sudo`, with a 5-attempt rate limit that locks access for 5 minutes after repeated failures.
 
@@ -126,14 +126,17 @@ Windows example:
 
 - `memory_remember`: explicitly save a project memory (identical or near-identical text updates the existing memory instead of duplicating)
 - `memory_update`: update text, tags, source, or the pinned flag of an existing memory by id
-- `memory_recall`: search memories with BM25-style ranking; prefix a token with `-` to exclude memories containing it (a query made only of exclusions still returns the project's other memories, ordered by pin and recency)
-- `memory_list`: list recent memories
+- `memory_recall`: search memories with BM25-style ranking; prefix a token with `-` to exclude memories containing it (a query made only of exclusions still returns the project's other memories, ordered by pin and recency). Narrow by time with `last` (`7d`), `after` or `before`
+- `memory_list`: list recent memories; accepts the same `last` / `after` / `before` window
+- `memory_tags`: list the tags in use for this project, most frequent first, with counts — the fastest way to find the vocabulary before a tagged recall
+- `memory_stats`: report store health and shape: path, encryption state, size, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, and a tag histogram. It distinguishes an empty store from a locked one from memories stranded under another project path
 - `memory_unlock`: verify the store password to enable encryption or access an encrypted store (5-attempt rate limit). Takes `passwordFile` (preferred) or `password`
 - `memory_forget`: permanently delete a memory by id
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
 - `memory_delete_store`: permanently delete all memories and remove the storage file
 - `memory_reassign`: list and rebind **stranded** memories — records that no longer belong to the current worktree. Two kinds are recovered in bulk: memories whose recorded project directory no longer exists (renamed, moved, or deleted project), and legacy records that belong to no project at all. Memories owned by a *different project that still exists* are never taken over in bulk; they are only rebindable one at a time by naming their ids. Stranded memories are invisible to every other tool, so this is the recovery path.
 - `memory_export`: show/export stored memories. `scope: "visible"` (default) exports the current worktree's memories; `scope: "all"` exports every record in the store, including legacy global-scope entries that no project can see (they are reported separately as `legacyGlobal`).
+- `memory_import`: restore memories from a `memory_export` payload (`data` JSON text or `file`). Dry run by default — pass `confirm: true` to write. Every entry is re-sanitized and capped, `onConflict` chooses between `skip` (default), `overwrite` and `new-id`, and entries recorded against another project are refused unless you pass `reassignToCurrent: true`. Imported entries carry the `imported` tag and are framed as untrusted data at injection time.
 - `image_read`: read an image or PDF so the model can actually *see* it — attaches the real image to the conversation and reports format, dimensions, and OCR'd text. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
 - `listen_analyze`: fetch and comprehensively analyze one public website: metadata, Open Graph data, headings, links, images, code, tables, lists, full text, and detected tech stack. SSRF-guarded, honors `robots.txt`, and runs under size, deadline, and content-type limits. Backed by the `/listen` slash command.
 
@@ -187,7 +190,7 @@ Stated plainly so nothing here is a surprise:
 
 ## Security and VAPT
 
-OpenMind v6 ships with a built-in static and dynamic security test suite, plus eslint and a GitHub Actions workflow that runs both on every push. `npm test` runs lint and all thirteen suites: `test/smoke.mjs`, `test/compat.mjs`, `test/encryption.mjs`, `test/locked.mjs`, `test/concurrency.mjs`, `test/store.mjs`, `test/ranking.mjs`, `test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, `test/vapt.mjs`, `test/vapt2.mjs`, and `test/regressions.mjs`:
+OpenMind v6 ships with a built-in static and dynamic security test suite, plus eslint and a GitHub Actions workflow that runs both on every push. `npm test` runs lint and all fourteen suites: `test/smoke.mjs`, `test/compat.mjs`, `test/encryption.mjs`, `test/locked.mjs`, `test/concurrency.mjs`, `test/store.mjs`, `test/ranking.mjs`, `test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, `test/vapt.mjs`, `test/vapt2.mjs`, `test/regressions.mjs`, and `test/v61.mjs`:
 
 - **Input injection / fuzzing** — newline-forged records, prototype-pollution tags, oversized text, regex metacharacters in queries.
 - **Tampered and corrupt stores** — the plugin never crashes or leaks partial data.
@@ -322,6 +325,25 @@ If you open the same project from several paths on purpose, set `namespace` (or 
 
 Namespace changes the stored key format to `ns:<name>`; memories saved before the change are not migrated automatically.
 
+## Backup and restore
+
+`memory_export` writes JSON to the tool output, so the simplest backup is to save that output. Restore it with `memory_import`:
+
+```text
+Save this export to ~/openmind-backup.json
+Import ~/openmind-backup.json into this project
+```
+
+The import is a dry run unless you pass `confirm: true`, and it reports exactly what it would write:
+
+- **Bounded.** The payload is capped at 8 MB and 5000 entries per call; an oversized payload is refused rather than silently truncated.
+- **Re-sanitized.** Every entry goes back through the same validation and caps as a fresh write (8,000-char text, 2,000-char source, 50 tags of 64 chars).
+- **Project-scoped.** Entries recorded against a different project are refused by default. Pass `reassignToCurrent: true` to adopt them into the current worktree deliberately.
+- **Collision policy.** `onConflict` is `skip` (default), `overwrite`, or `new-id`. `overwrite` may only replace a record this project owns; a foreign id is always given a fresh id, so an import can never delete or take over another project's memory.
+- **Marked untrusted.** Imported entries get the `imported` tag, which is sticky through `memory_update` and makes the injection block frame them as untrusted quoted data, exactly like `/listen` content.
+
+`memory_stats` is the quickest way to check the result: it reports the store path, size, encryption state, and how many memories are visible here versus stranded under another path.
+
 ## Injection budget
 
 Saved memories are injected into the system prompt on every turn. Three settings control how much:
@@ -396,6 +418,6 @@ npm test
 npm pack
 ```
 
-`npm test` runs ESLint, a syntax check, and the thirteen suites in `test/`. The `image` suite drives the real Python helper, so it needs `python3` with Pillow and uses `tesseract` and a PDF rasterizer (`pdftoppm`/`mutool`/`gs`) when they are installed; everything else runs on a bare Node install. CI installs those optional packages so the full feature path is exercised on every push. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
+`npm test` runs ESLint, a syntax check, and the fourteen suites in `test/`. The `image` suite drives the real Python helper, so it needs `python3` with Pillow and uses `tesseract` and a PDF rasterizer (`pdftoppm`/`mutool`/`gs`) when they are installed; everything else runs on a bare Node install. CI installs those optional packages so the full feature path is exercised on every push. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
 
 `install.mjs` accepts `--commands global` (default), `--commands project`, or `--commands none` to control where the slash commands go.

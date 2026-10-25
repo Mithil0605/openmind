@@ -1,6 +1,6 @@
 {
   "name": "openmind-v5",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "type": "module",
   "description": "Privacy-first, user-controlled memory tools for OpenCode V2 — project-scoped BM25 recall, SSRF-hardened web listening, image/PDF reading with OCR, and optional AES-256-GCM encryption. No session persistence.",
   "main": "index.js",
@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "lint": "eslint .",
-    "test:unit": "node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/store.mjs && node test/ranking.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs && node test/vapt2.mjs && node test/regressions.mjs",
+    "test:unit": "node test/smoke.mjs && node test/compat.mjs && node test/encryption.mjs && node test/locked.mjs && node test/concurrency.mjs && node test/store.mjs && node test/ranking.mjs && node test/security.mjs && node test/image.mjs && node test/listen.mjs && node test/vapt.mjs && node test/vapt2.mjs && node test/regressions.mjs && node test/v61.mjs",
     "test": "npm run lint && node --check index.js && npm run test:unit",
     "pack:local": "npm pack",
     "setup": "node install.mjs"
@@ -55,13 +55,11 @@
     "type": "git",
     "url": "git+https://github.com/Mithil0605/openmind.git"
   },
-  "dependencies": {
-    "@opencode-ai/plugin": "1.18.33"
-  },
   "engines": {
     "node": ">=22"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "1.18.33",
     "eslint": "^9.39.5"
   }
 }
