@@ -7,6 +7,56 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
+## Status (as of 6.0.0, commit `8c722aa`)
+
+**Done — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are fixed and
+each one now has a regression test in `test/regressions.mjs`, so the thirteen-suite
+`npm test` gate catches a reintroduction.
+
+| Item | Fix |
+|---|---|
+| #1 injection key mismatch | The tool path and the injection path now resolve the project key through one helper, so a memory written by the tools is injected back. Corrected root cause: the plugin instance is loaded *per location*, and that location is the **project** the instance serves, not necessarily the session's directory. |
+| #2 sanitizer bypass | Dedupe updates, `memory_update` and `memory_reassign` all rebuild the record through `sanitizeEntry`. |
+| #3 negation-only recall | A query with no positive terms filters by exclusion and ranks by pinned/recency. |
+| #4 reassign mislabels live projects | Orphans are inferred from a *missing project directory*, not from path difference. A live project's memories are never taken by a bulk rebind; one can only be moved by naming its id explicitly. |
+| #5 dead `global` scope | Legacy globals are counted separately and returned by `memory_export { scope: "all" }`, and `memory_reassign` adopts them into the current project. |
+| #20 test gaps | `test/regressions.mjs` covers (a) save-then-inject across directories, (b) source/tag caps through dedupe and update, (c) negative-only queries, (d) reassign ownership, (e) global-scope visibility, plus moved-session isolation and preview/confirm consistency. |
+
+**Behaviour changes worth knowing (breaking):**
+
+- `memory_reassign` previews and confirms share one selection, so `metadata.count`
+  always describes what the matching `confirm` would move. A preview that names
+  `ids` now reports the selected count instead of the whole orphan set.
+- `includeForeign` renders only an id, the owning project and a ≤120-character
+  excerpt, capped at 25 items. It is a review aid, not a content dump.
+- `memory_export { scope: "all" }` is still a full-store dump, but it now carries a
+  `scope` and a cross-project `warning` field. It is a recovery/diagnostic escape
+  hatch, not the normal migration path.
+
+**Open follow-ups (not in 6.0.0):**
+
+1. **Stable project identity (#7).** Scope is still a raw absolute path. Routing
+   the key through `ctx.location.project.id` / `session.projectID` fixes the
+   *isolation* question but not the *renaming* one: moving a checkout still
+   orphans its memories. This is the highest-value remaining correctness item.
+2. **`memory_import` (#6).** Still the only missing half of export; a cleared store
+   remains unrecoverable without hand-editing JSONL.
+3. **Cross-project visibility.** `memory_export { scope: "all" }` plus an explicit-id
+   `memory_reassign` is, together, a two-call primitive for moving another project's
+   memory. That is inherent to having any cross-project recovery path; the wording
+   now says so instead of claiming it is impossible. A capability model (per-project
+   opt-in for cross-project reads) would close it properly.
+4. **Export size cap.** `memory_export` is still unbounded in output size; with a
+   large store it can exhaust the model's context. Same class of issue as #8.
+5. **Namespace orphan recovery.** In namespace mode (`ns:team`) no record looks like
+   a filesystem path, so every foreign record is classified live and bulk recovery
+   finds nothing. Needs its own notion of "the namespace no longer exists".
+6. **`useSessionProject` is not configurable.** The instance project always wins; a
+   user who deliberately moves a session to another checkout gets the old project's
+   memories. A documented option would make that intentional rather than surprising.
+
+---
+
 ## P0 — Correctness bugs (all reproduced)
 
 ### 1. Injection is keyed to the plugin directory, not the session directory — memories are saved but never injected
