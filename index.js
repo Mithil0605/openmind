@@ -900,6 +900,84 @@ const LOCKOUT_FILE = "lockout.json";
 const ENC_V3_HEADER = "OPENMIND_ENC_V3\n";
 const ENC_V2_HEADER = "OPENMIND_ENC_V2\n";
 
+// ---------------------------------------------------------------------------
+// Store format version (v6).
+//
+// Both store shapes now carry an explicit version, so an upgrade is a decision
+// the code makes instead of something inferred from which parse succeeded:
+//
+//   plaintext: first line `{"openmind":6}`, then one JSON entry per line.
+//              The marker is a plain JSON object with no id/text, so every
+//              earlier version already drops it in parseLegacyLine() and keeps
+//              reading the file. Downgrading therefore loses the marker, not
+//              the data.
+//   encrypted: the plaintext body is `{"openmind":6,"entries":[...]}` inside
+//              the AES-GCM payload. An older build sees an object where it
+//              expects an array and fails closed (reports the store as locked)
+//              instead of overwriting it with an empty store.
+//
+// A store that declares a version newer than this build is refused rather than
+// silently rewritten: a newer format may use fields this code would drop on the
+// next save, and losing memories to a downgrade is worse than a clear error.
+// ---------------------------------------------------------------------------
+const STORE_VERSION = 6;
+const STORE_HEADER_KEY = "openmind";
+
+function storeHeaderLine(version = STORE_VERSION) {
+  return JSON.stringify({ [STORE_HEADER_KEY]: version });
+}
+
+// Returns the declared version, or null when the line is not a store header.
+// A real memory always has an id and text, so one can never be mistaken for the
+// marker even if a hand-edited entry happens to carry an `openmind` field.
+function parseStoreHeader(line) {
+  if (typeof line !== "string" || line[0] !== "{") return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if ("id" in parsed || "text" in parsed) return null;
+  const value = parsed[STORE_HEADER_KEY];
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+// Encrypted payloads are versioned the same way, inside the ciphertext so the
+// version cannot be edited without the password.
+function packStoreBody(entries, version = STORE_VERSION) {
+  return version >= 6 ? { [STORE_HEADER_KEY]: version, entries } : entries;
+}
+
+// Accepts both the v6 envelope and the bare array every earlier version wrote.
+function unpackStoreBody(parsed) {
+  if (Array.isArray(parsed)) return { version: 5, entries: parsed };
+  if (parsed && typeof parsed === "object" && Array.isArray(parsed.entries)) {
+    const version = Number.isInteger(parsed[STORE_HEADER_KEY]) ? parsed[STORE_HEADER_KEY] : 5;
+    return { version, entries: parsed.entries };
+  }
+  return null;
+}
+
+// The upgrade steps a store of `version` still needs. Every writer emits the
+// current shape, so a migration is completed by the next successful save; this
+// list exists so `memory_stats` can say what is pending and so the step has a
+// name in tests rather than being an implicit side effect of writing.
+const STORE_MIGRATIONS = [
+  {
+    from: 5,
+    to: 6,
+    name: "versioned-envelope",
+    note: "add the plaintext version header / encrypted v6 envelope",
+  },
+];
+
+function pendingStoreMigrations(version) {
+  if (!Number.isInteger(version) || version >= STORE_VERSION) return [];
+  return STORE_MIGRATIONS.filter((step) => step.from >= version);
+}
+
 // Stronger-than-default scrypt cost. Derived keys are cached per
 // (password, salt, params) and each store reuses its own salt, so re-encrypting
 // the same store (every save) never pays the KDF cost twice.
@@ -908,6 +986,18 @@ const LEGACY_KDF_PARAMS = { n: 1 << 15, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
 
 const LOCK_MSG =
   "OpenMind: the memory store is encrypted and locked. Call memory_unlock with your password to access saved preferences.";
+
+// A store can be unreadable for two very different reasons, and only one of them
+// is fixed by typing a password. A store written by a newer build must be
+// refused explicitly: treating it like a locked store would tell the user to
+// unlock something no password can open.
+function storeRefusal(vault) {
+  if (vault.mode === "locked") return LOCK_MSG;
+  if (vault.mode === "unsupported") {
+    return `OpenMind: this store declares format v${vault.version}, but this plugin supports up to v${STORE_VERSION}. It is left untouched so newer data is not lost - update OpenMind before writing to it.`;
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Persistent password lockout. The counter lives on disk next to the store, so
@@ -1129,13 +1219,15 @@ function kdfParamsFromLine(line) {
   return { n, r, p, maxmem: Math.max(64 * 1024 * 1024, 128 * n * r * 2) };
 }
 
-async function encryptPayload(file, password, entries, params, salt) {
+async function encryptPayload(file, password, entries, params, salt, version = STORE_VERSION) {
   const kp = params || KDF_PARAMS;
   const usedSalt = salt || randomBytes(16);
   const iv = randomBytes(12);
   const key = await deriveKey(file, password, usedSalt, kp);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const body = Buffer.from(JSON.stringify(entries), "utf8");
+  // The version travels inside the ciphertext: it cannot be downgraded by
+  // editing the file without the password.
+  const body = Buffer.from(JSON.stringify(packStoreBody(entries, version)), "utf8");
   const encrypted = Buffer.concat([cipher.update(body), cipher.final()]);
   const tag = cipher.getAuthTag();
   return { payload: [usedSalt, iv, tag, encrypted].map((part) => part.toString("base64")).join(":"), salt: usedSalt };
@@ -1213,12 +1305,30 @@ async function writeEncrypted(file, password, entries, opts = {}) {
 // New plaintext keys are appended in O(1) instead of rewriting the whole JSONL
 // file on every save. Never appends through a symlink (falls back to an atomic
 // replace, which swaps the link for a real file without touching its target).
+//
+// Appending is only safe when the file already starts with the current version
+// marker: a v5 file has no such line, and blindly appending would keep it
+// unversioned forever. In that case return false so the caller does the full
+// atomic write, which is what performs the v5 -> v6 upgrade.
 async function appendPlaintextLine(file, entry) {
   await ensurePrivateDir(dirname(file));
   try {
     const linked = await lstat(file);
     if (linked.isSymbolicLink()) return false;
   } catch {}
+  try {
+    const handle = await open(file, "r");
+    try {
+      const probe = Buffer.alloc(64);
+      const { bytesRead } = await handle.read(probe, 0, probe.length, 0);
+      const firstLine = probe.subarray(0, bytesRead).toString("utf8").split("\n")[0];
+      if (parseStoreHeader(firstLine) !== STORE_VERSION) return false;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false;
+  }
   const handle = await open(file, "a", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf8");
@@ -1231,7 +1341,8 @@ async function appendPlaintextLine(file, entry) {
 
 async function writePlaintext(file, entries) {
   const body = entries.map((entry) => JSON.stringify(entry)).join("\n");
-  await writeAtomic(file, body ? `${body}\n` : "");
+  const header = storeHeaderLine();
+  await writeAtomic(file, body ? `${header}\n${body}\n` : `${header}\n`);
 }
 
 // C0/C1 controls, DEL, and the Unicode bidi overrides. Every field except the
@@ -1293,15 +1404,25 @@ function parseLegacyLine(line) {
 }
 
 async function readStoreRaw(file) {
-  if (!existsSync(file)) return { kind: "missing", mtimeMs: 0, entries: [], params: null, salt: null };
+  if (!existsSync(file)) return { kind: "missing", version: STORE_VERSION, mtimeMs: 0, entries: [], params: null, salt: null };
   const [raw, info] = await Promise.all([readFile(file, "utf8"), stat(file)]);
   const enc = parseEncrypted(raw);
   if (enc) {
-    if (enc.corrupt) return { kind: "corrupt", mtimeMs: info.mtimeMs, entries: [], params: null, salt: null };
-    return { kind: "encrypted", payload: enc.payload, params: enc.params, salt: enc.salt, legacy: enc.legacy, mtimeMs: info.mtimeMs, entries: [] };
+    if (enc.corrupt) return { kind: "corrupt", version: null, mtimeMs: info.mtimeMs, entries: [], params: null, salt: null };
+    return { kind: "encrypted", payload: enc.payload, params: enc.params, salt: enc.salt, legacy: enc.legacy, version: null, mtimeMs: info.mtimeMs, entries: [] };
   }
-  const entries = raw.split("\n").filter(Boolean).map(parseLegacyLine).filter(Boolean);
-  return { kind: "plaintext", mtimeMs: info.mtimeMs, entries, params: null, salt: null };
+  const lines = raw.split("\n");
+  // The header is only ever the first line. Detecting it anywhere else would let
+  // an entry-shaped line change how the rest of the file is interpreted.
+  const declared = parseStoreHeader(lines[0]);
+  if (declared !== null) {
+    if (declared > STORE_VERSION) {
+      return { kind: "future", version: declared, mtimeMs: info.mtimeMs, entries: [], params: null, salt: null };
+    }
+    lines.shift();
+  }
+  const entries = lines.filter(Boolean).map(parseLegacyLine).filter(Boolean);
+  return { kind: "plaintext", version: declared ?? 5, mtimeMs: info.mtimeMs, entries, params: null, salt: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,8 +1436,8 @@ async function readStoreRaw(file) {
 // ---------------------------------------------------------------------------
 const vaults = new Map();
 
-function newVaultState(file, mtimeMs = 0, salt = null, params = null) {
-  return { file, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs, salt, params };
+function newVaultState(file, mtimeMs = 0, salt = null, params = null, version = STORE_VERSION) {
+  return { file, mode: "uninitialized", entries: [], encrypted: false, password: null, mtimeMs, salt, params, version, index: null };
 }
 
 function getVault(file) {
@@ -1335,16 +1456,23 @@ function setVault(file, state) {
 
 async function loadVault(file, autoPassword) {
   const raw = await readStoreRaw(file);
-  setVault(file, newVaultState(file, raw.mtimeMs, raw.salt, raw.params));
+  setVault(file, newVaultState(file, raw.mtimeMs, raw.salt, raw.params, raw.version ?? STORE_VERSION));
   const vault = getVault(file);
 
   if (raw.kind === "missing") {
     if (autoPassword) {
       const salt = await writeEncrypted(file, autoPassword, []);
-      setVault(file, { file, mode: "encrypted", entries: [], encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS });
+      setVault(file, { file, mode: "encrypted", entries: [], encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS, version: STORE_VERSION, index: null });
     } else {
       vault.mode = "plaintext";
     }
+    return;
+  }
+
+  // A store written by a newer build may contain fields this code does not know
+  // about. Reading it is fine; writing would drop them, so refuse to touch it.
+  if (raw.kind === "future") {
+    vault.mode = "unsupported";
     return;
   }
 
@@ -1355,11 +1483,12 @@ async function loadVault(file, autoPassword) {
 
   if (raw.kind === "plaintext") {
     vault.entries = raw.entries;
+    vault.version = raw.version ?? 5;
     vault.mode = "plaintext";
     if (autoPassword) {
       const entries = raw.entries;
       const salt = await writeEncrypted(file, autoPassword, entries);
-      setVault(file, { file, mode: "encrypted", entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS });
+      setVault(file, { file, mode: "encrypted", entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params: KDF_PARAMS, version: STORE_VERSION, index: null });
     }
     return;
   }
@@ -1369,16 +1498,25 @@ async function loadVault(file, autoPassword) {
     // must not consume the user's interactive lockout budget: that password is
     // not something they typed, and it goes stale on every other process's write.
     try {
-      const entries = (await decryptPayload(file, raw.payload, autoPassword, raw.params))
-        .map(sanitizeEntry)
-        .filter(Boolean);
+      const body = unpackStoreBody(await decryptPayload(file, raw.payload, autoPassword, raw.params));
+      if (!body) throw new Error("Malformed store body.");
+      if (body.version > STORE_VERSION) {
+        vault.mode = "unsupported";
+        return;
+      }
+      const entries = body.entries.map(sanitizeEntry).filter(Boolean);
       let salt = raw.salt;
       let params = raw.params;
-      if (raw.legacy) {
+      let version = body.version;
+      if (raw.legacy || version < STORE_VERSION) {
+        // Upgrading on load is safe here only because the password was already
+        // proven: the store is re-encrypted with the current KDF and the current
+        // envelope in one atomic write.
         salt = await writeEncrypted(file, autoPassword, entries);
         params = KDF_PARAMS;
+        version = STORE_VERSION;
       }
-      setVault(file, { file, mode: "encrypted", entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params });
+      setVault(file, { file, mode: "encrypted", entries, encrypted: true, password: autoPassword, mtimeMs: (await stat(file)).mtimeMs, salt, params, version, index: null });
     } catch {
       vault.mode = "locked";
     }
@@ -1401,6 +1539,10 @@ async function ensureLoaded(file, autoPassword) {
 
 async function saveVault(file) {
   const vault = getVault(file);
+  // Every mutation path ends here (the O(1) append shortcut included, via its
+  // caller), so this is the single place the derived search index is dropped.
+  // Rebuilding it is lazy: the next recall pays for it once.
+  vault.index = null;
   if (vault.mode === "encrypted") {
     if (!vault.password) throw new Error("OpenMind: cannot write the encrypted store without its password.");
     const salt = await writeEncrypted(file, vault.password, vault.entries, {
@@ -1409,6 +1551,7 @@ async function saveVault(file) {
     });
     vault.salt = salt;
     vault.params = vault.params || KDF_PARAMS;
+    vault.version = STORE_VERSION;
     vault.mtimeMs = (await stat(file)).mtimeMs;
   } else if (vault.mode === "plaintext") {
     if (vault.entries.length === 0) {
@@ -1416,6 +1559,7 @@ async function saveVault(file) {
       vault.mtimeMs = 0;
     } else {
       await writePlaintext(file, vault.entries);
+      vault.version = STORE_VERSION;
       vault.mtimeMs = (await stat(file)).mtimeMs;
     }
   } else {
@@ -1894,6 +2038,14 @@ function buildStats(vault, key, file, bytes) {
     tags: tagHistogram(visible),
     oldest: oldestMs === null ? null : new Date(oldestMs).toISOString(),
     newest: newestMs === null ? null : new Date(newestMs).toISOString(),
+    // Store format, and what is still missing before it is current. Nothing is
+    // hidden behind a rebuild: the next successful write completes the upgrade.
+    format: vault.version ?? STORE_VERSION,
+    pendingMigrations: pendingStoreMigrations(vault.version ?? STORE_VERSION).map((step) => step.name),
+    // Index health: -1 means "not built yet in this process" (it is built
+    // lazily by the first recall), otherwise the number of indexed documents.
+    indexDocs: vault.index ? vault.index.docs.size : -1,
+    indexTerms: vault.index ? vault.index.terms.length : -1,
   };
 }
 
@@ -1902,6 +2054,7 @@ function formatStats(stats, key) {
     `OpenMind store: ${stats.file}`,
     `  exists: ${stats.exists ? "yes" : "no (empty store)"}   size: ${stats.size}`,
     `  encryption: ${stats.encrypted ? "on (AES-256-GCM)" : "off (plaintext)"}   mode: ${stats.mode}`,
+    `  format: v${stats.format}${stats.pendingMigrations.length ? ` (upgrades to v${STORE_VERSION} on the next write)` : " (current)"}`,
     `  current project: ${key ?? "(none)"}`,
     `  memories: ${stats.total} total, ${stats.visible} visible here, ${stats.pinned} pinned (visible)`,
   ];
@@ -1910,6 +2063,11 @@ function formatStats(stats, key) {
       `  stranded: ${stats.orphaned} recoverable orphan(s), ${stats.foreignLive} owned by another live project, ${stats.legacyGlobal} legacy global`,
     );
     if (stats.orphaned || stats.legacyGlobal) lines.push("  run memory_reassign to review and adopt the recoverable ones");
+  }
+  if (stats.indexDocs >= 0) {
+    lines.push(`  search index: ${stats.indexDocs} document(s), ${stats.indexTerms} term(s), in memory`);
+  } else {
+    lines.push("  search index: not built yet (first recall builds it)");
   }
   if (stats.oldest) lines.push(`  oldest visible: ${stats.oldest}`);
   if (stats.newest) lines.push(`  newest visible: ${stats.newest}`);
@@ -2514,7 +2672,8 @@ let startupWarning = "";
     withStoreGuard(async () => {
       await ensureLoaded(file, autoPassword);
       const vault = getVault(file);
-      if (vault.mode === "locked") return { error: LOCK_MSG };
+      const refusal = storeRefusal(vault);
+      if (refusal) return { error: refusal };
       const key = projectKey(context);
       const trimmed = String(text).trim().slice(0, MAX_TEXT_LENGTH);
       const tagList = asArray(tags).slice(0, 50);
@@ -2625,7 +2784,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const memory = vault.entries.find(
                 (entry) => entry.id === args.id && visibleToProject(entry, projectKey(context)),
               );
@@ -2682,7 +2842,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const memories = filterMemories(vault.entries, projectKey(context), args);
               if (!Array.isArray(memories)) return memories.error;
               return memories.length ? memories.map(formatMemory).join("\n") : "No matching memories found.";
@@ -2704,7 +2865,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const window = resolveTimeWindow(args);
               if (window.error) return window.error;
               const limit = Math.max(1, Math.min(Number(args.limit || 20), 50));
@@ -2729,7 +2891,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const key = projectKey(context);
               let bytes = 0;
               try {
@@ -2754,6 +2917,10 @@ let startupWarning = "";
                   oldest: stats.oldest,
                   newest: stats.newest,
                   tags: stats.tags.length,
+                  format: stats.format,
+                  pendingMigrations: stats.pendingMigrations,
+                  indexDocs: stats.indexDocs,
+                  indexTerms: stats.indexTerms,
                 },
               };
             }),
@@ -2772,7 +2939,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
               const limit = Math.max(1, Math.min(Number(args.limit || MAX_TAG_REPORT), 100));
               const tags = tagHistogram(visible).slice(0, limit);
@@ -2803,7 +2971,8 @@ let startupWarning = "";
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
 
               let payload = "";
               if (typeof args.data === "string" && args.data.trim()) {
@@ -2945,7 +3114,9 @@ async execute(args, context) {
               }
               if (raw.kind === "encrypted") {
                 try {
-                  const entries = (await decryptPayload(file, raw.payload, password, raw.params)).map(sanitizeEntry).filter(Boolean);
+                  const body = unpackStoreBody(await decryptPayload(file, raw.payload, password, raw.params));
+                  if (!body) return "OpenMind: the store body is malformed and cannot be unlocked.";
+                  const entries = body.entries.map(sanitizeEntry).filter(Boolean);
                   let salt = raw.salt;
                   let params = raw.params;
                   if (raw.legacy) {
@@ -2984,6 +3155,9 @@ async execute(args, context) {
               if (raw.kind === "corrupt") {
                 return "The store is corrupt or has been tampered with and cannot be unlocked.";
               }
+              if (raw.kind === "future") {
+                return `OpenMind: this store declares format v${raw.version}, but this plugin supports up to v${STORE_VERSION}. It is left untouched so newer data is not lost - update OpenMind first.`;
+              }
               const salt = await writeEncrypted(file, password, raw.entries);
               setVault(file, {
                 file,
@@ -3012,7 +3186,8 @@ async execute(args, context) {
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const index = vault.entries.findIndex(
                 (memory) => memory.id === args.id && visibleToProject(memory, projectKey(context)),
               );
@@ -3048,7 +3223,8 @@ async execute(args, context) {
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               const matches = vault.entries.filter((memory) => {
                 if (!visibleToProject(memory, projectKey(context))) return false;
                 if (ids.has(memory.id)) return true;
@@ -3088,7 +3264,9 @@ async execute(args, context) {
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              const count = vault.mode === "locked" ? null : vault.entries.length;
+              // An unsupported store has no readable entries, so reporting 0
+              // would understate what is being deleted.
+              const count = vault.mode === "locked" || vault.mode === "unsupported" ? null : vault.entries.length;
               await rm(file, { force: true });
               // The lockfile is deliberately NOT removed here: this process still
               // holds it, and unlinking it under our own feet would let a second
@@ -3126,7 +3304,8 @@ async execute(args, context) {
             withStoreGuard(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
 
               // Deliberately does not go through visibleToProject: the whole point
               // is to reach records this project cannot otherwise see.
@@ -3236,7 +3415,8 @@ async execute(args, context) {
             withLock(async () => {
               await ensureLoaded(file, autoPassword);
               const vault = getVault(file);
-              if (vault.mode === "locked") return LOCK_MSG;
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
               // "all" means all: the legacy global-scope records are invisible
               // to every project, so dropping them here would make them
               // unreachable and unrecoverable. They are counted separately so
@@ -3495,10 +3675,12 @@ async execute(args, context) {
         worktree: input.worktree ?? _input.worktree,
       };
       const lastUserMessageText = lastUserText(output.messages);
+      let refusal = null;
       const memories = await withLock(async () => {
         await ensureLoaded(file, autoPassword);
         const vault = getVault(file);
-        if (vault.mode === "locked") return null;
+        refusal = storeRefusal(vault);
+        if (refusal) return null;
         const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
         return budgetMemories(orderForInjection(visible, lastUserMessageText), {
           limit: injectLimit,
@@ -3506,10 +3688,11 @@ async execute(args, context) {
           itemMaxChars: injectItemMaxChars,
         });
       });
-      if (memories === null) {
-        output.system.push(LOCK_MSG);
+      if (refusal) {
+        output.system.push(refusal);
         return;
       }
+      if (memories === null) return;
       const block = memoryBlock(memories);
       if (block) output.system.push(block);
     },
@@ -3644,4 +3827,19 @@ export {
   listenSummary,
   storagePath,
   decodeBody,
+  // Store format v6: exported so the migration suite can build a historical
+  // fixture (a v5 bare-array payload, or a v2 legacy-KDF file) and assert that
+  // loading it produces the current envelope without losing entries.
+  parseStoreHeader,
+  packStoreBody,
+  unpackStoreBody,
+  pendingStoreMigrations,
+  encryptPayload,
+  writeEncrypted,
+  readStoreRaw,
+  ENC_V3_HEADER,
+  ENC_V2_HEADER,
+  KDF_PARAMS,
+  LEGACY_KDF_PARAMS,
+  STORE_VERSION,
 };
