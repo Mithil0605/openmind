@@ -2244,7 +2244,10 @@ function budgetMemories(memories, { limit, maxChars, itemMaxChars }) {
     used += cost;
     chosen.push({ ...memory, text, _injectTags: tags });
   }
-  return chosen;
+  // `dropped` is derived rather than counted in two places: a `break` on the
+  // limit and a `continue` on the budget both reduce the same total, and the
+  // footer only needs to be right.
+  return { chosen, dropped: memories.length - chosen.length, considered: memories.length, used };
 }
 
 // Order for injection: pinned first, then a light relevance pass against the
@@ -2299,6 +2302,19 @@ function isUntrustedMemory(memory) {
 // UNTRUSTED framing from web-derived or imported text.
 function stickyTags(memory) {
   return (memory?.tags || []).filter((tag) => UNTRUSTED_TAGS.has(String(tag).toLowerCase()));
+}
+
+// A provenance footer for the injection block, rendered OUTSIDE the fence so it
+// is ordinary system text rather than quoted memory content.
+//
+// Without it, "the assistant forgot what I told it" and "the plugin injected
+// nothing" look identical from the outside: an empty store, a full budget and a
+// dropped set all produce silence. One line makes the difference observable.
+// Kept terse on purpose - it is added to every turn that injects anything.
+function memoryFooter(stats, key) {
+  const project = compactProject(key) || "(no project)";
+  const suffix = stats.dropped > 0 ? `, ${stats.dropped} not shown (budget)` : "";
+  return `[OpenMind: injected ${stats.chosen.length} of ${stats.considered} saved memories for ${project}${suffix}.]`;
 }
 
 function memoryBlock(memories) {
@@ -2594,6 +2610,12 @@ function listenSummary(href, analysis) {
 export const MemoryPlugin = async (_input, options = {}) => {
   const file = storagePath(options);
   const autoInject = options.autoInject !== false;
+  // Injection transparency (#18). On by default, because a silent zero-injection
+  // is the one failure mode a user cannot diagnose from the outside; opt out with
+  // the option or OPENMIND_INJECTION_FOOTER=0.
+  const injectionFooter =
+    options.injectionFooter !== false &&
+    !["0", "false", "off", "no"].includes(String(process.env.OPENMIND_INJECTION_FOOTER || "").trim().toLowerCase());
   const injectLimit = Math.max(1, Math.min(Number(options.injectLimit || 8), 25));
   // injectLimit alone is not a budget: 8 memories x 8000 chars is ~16k tokens of
   // context burned on every single turn. Cap the total characters injected, and
@@ -3692,9 +3714,17 @@ async execute(args, context) {
         output.system.push(refusal);
         return;
       }
-      if (memories === null) return;
-      const block = memoryBlock(memories);
-      if (block) output.system.push(block);
+      if (!memories) return;
+      const block = memoryBlock(memories.chosen);
+      // The footer is emitted whenever there was anything to consider, including
+      // the case where everything was dropped: "0 of 12 injected" is exactly the
+      // fact the user needs, and it is the case that used to render as nothing at
+      // all. A project with no saved memories stays silent instead of adding a
+      // line to every turn.
+      const footer =
+        injectionFooter && memories.considered > 0 ? memoryFooter(memories, projectKey(context)) : "";
+      if (block) output.system.push(footer ? `${block}\n${footer}` : block);
+      else if (footer) output.system.push(footer);
     },
 
     async "shell.env"(input, output) {
