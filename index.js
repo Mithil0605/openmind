@@ -2497,7 +2497,13 @@ function stickyTags(memory) {
 // dropped set all produce silence. One line makes the difference observable.
 // Kept terse on purpose - it is added to every turn that injects anything.
 function memoryFooter(stats, key) {
-  const project = compactProject(key) || "(no project)";
+  // The path is only context, never input to the model, but it is a string from
+  // the filesystem: a directory named with a newline must not be able to add a
+  // line to the system prompt through the footer.
+  // Brackets are stripped for the same reason tags strip them: the footer is
+  // read as one line, and a path carrying "] [OpenMind: ..." would fabricate a
+  // second, contradictory footer inside the first.
+  const project = cleanInline(compactProject(key) || "(no project)", 80).replace(/[[\]]/g, "");
   const suffix = stats.dropped > 0 ? `, ${stats.dropped} not shown (budget)` : "";
   return `[OpenMind: injected ${stats.chosen.length} of ${stats.considered} saved memories for ${project}${suffix}.]`;
 }
