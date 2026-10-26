@@ -27,7 +27,7 @@ lib/imgread.py        image/PDF/OCR helper (invoked with an argv array, no shell
 commands/             /listen and /imgread slash commands (copied by install.mjs)
 install.mjs           cross-platform setup: deps, plugin registration, commands
 install.sh/.cmd/.ps1  thin launchers around install.mjs
-test/                 14 executable suites (see section 9)
+test/                 15 executable suites (see section 9)
 .github/workflows/    CI: lint + syntax check + the full suite on Node 22 and 24
 ```
 
@@ -166,10 +166,10 @@ files are parsed and raw bytes are never echoed.
 
 ## 9. Testing and CI
 
-`npm test` runs ESLint, `node --check`, then 14 suites:
+`npm test` runs ESLint, `node --check`, then 15 suites:
 
 `smoke`, `compat`, `encryption`, `locked`, `concurrency`, `store`, `ranking`,
-`security`, `image`, `listen`, `vapt`, `vapt2`, `regressions`, `v61`.
+`security`, `image`, `listen`, `vapt`, `vapt2`, `regressions`, `v61`, `dast`.
 
 `regressions` pins the v6.0 correctness fixes (injection keying, write-path
 caps, negation-only recall, reassign ownership, legacy globals, moved-session

@@ -1234,6 +1234,26 @@ async function writePlaintext(file, entries) {
   await writeAtomic(file, body ? `${body}\n` : "");
 }
 
+// C0/C1 controls, DEL, and the Unicode bidi overrides. Every field except the
+// memory text is rendered inline by a tool (the id on the first line, the tags
+// in brackets, the timestamp in parentheses), so a newline in any of them is a
+// way to forge an extra line that looks like another memory owned by another
+// project. Text keeps newlines because a memory is legitimately multi-line.
+const INLINE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+
+function cleanInline(value, max) {
+  return String(value).replace(INLINE_CONTROL_CHARS, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+// A timestamp is only kept when it is a short string that actually parses. A
+// value that does not parse cannot satisfy a time window, and an unbounded one
+// is both an output amplifier and a way to win every recency sort.
+function cleanTimestamp(value) {
+  if (typeof value !== "string") return "";
+  const cleaned = cleanInline(value, 40);
+  return Number.isFinite(Date.parse(cleaned)) ? cleaned : "";
+}
+
 function sanitizeEntry(item) {
   if (!item || typeof item !== "object") return null;
   if (typeof item.id !== "string" || !item.id) return null;
@@ -1242,7 +1262,10 @@ function sanitizeEntry(item) {
   const tags = Array.isArray(item.tags)
     ? item.tags
         .filter((tag) => typeof tag === "string")
-        .map((tag) => tag.slice(0, 64))
+        // Structural characters are stripped too: a tag is rendered inside
+        // [...] and next to "(scope, timestamp)", so brackets and parentheses
+        // let a tag imitate the record's own fields even on a single line.
+        .map((tag) => cleanInline(tag, 64).replace(/[\])[(]/g, ""))
         .filter(Boolean)
         .slice(0, 50)
     : [];
@@ -1252,10 +1275,12 @@ function sanitizeEntry(item) {
     tags,
     scope: item.scope === "global" ? "global" : "project",
     source: typeof item.source === "string" ? item.source.slice(0, 2000) : null,
-    pinned: Boolean(item.pinned),
+    // Only a real boolean pins. A truthy object would let an imported payload
+    // pin itself without saying so.
+    pinned: item.pinned === true,
     project: typeof item.project === "string" ? item.project : null,
-    createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
-    updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
+    createdAt: cleanTimestamp(item.createdAt),
+    updatedAt: cleanTimestamp(item.updatedAt),
   };
 }
 
@@ -1765,11 +1790,14 @@ function filterMemories(memories, key, args = {}) {
     .map(({ entry }) => entry);
 }
 
+// Ids are rendered through cleanInline even though the store's own ids are
+// UUIDs: a hand-edited store or a pre-validation import could otherwise put a
+// newline in one and forge a line that looks like a separate memory.
 function formatMemory(memory) {
   const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
   const pin = memory.pinned ? " pinned" : "";
   const project = memory.scope === "project" ? ` project=${compactProject(memory.project)}` : "";
-  return `- ${memory.id}${tags}${pin} (${memory.scope}${project}, ${memory.updatedAt})\n  ${memory.text}`;
+  return `- ${cleanInline(memory.id, 128)}${tags}${pin} (${memory.scope}${project}, ${memory.updatedAt})\n  ${memory.text}`;
 }
 
 // A redacted rendering, used for memories that belong to a project which still
@@ -1782,7 +1810,7 @@ function formatMemorySummary(memory) {
   const excerpt = flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
   const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
   const project = compactProject(memory.project) || "(none)";
-  return `- ${memory.id}${tags} (project=${project}, ${memory.updatedAt})\n  ${excerpt}`;
+  return `- ${cleanInline(memory.id, 128)}${tags} (project=${project}, ${memory.updatedAt})\n  ${excerpt}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,12 +1866,18 @@ function formatBytes(count) {
 function buildStats(vault, key, file, bytes) {
   const visible = vault.entries.filter((memory) => visibleToProject(memory, key));
   const foreign = classifyForeign(vault.entries, key);
-  const stamps = visible
-    .map((memory) => Date.parse(memory.createdAt || memory.updatedAt || ""))
-    .filter((value) => Number.isFinite(value));
-  const updated = visible
-    .map((memory) => Date.parse(memory.updatedAt || ""))
-    .filter((value) => Number.isFinite(value));
+  // Accumulated in a loop rather than Math.min(...stamps): a store with a few
+  // hundred thousand entries exceeds the argument limit and throws a
+  // RangeError, i.e. memory_stats would fail exactly when a large store makes it
+  // most useful.
+  let oldestMs = null;
+  let newestMs = null;
+  for (const memory of visible) {
+    const created = Date.parse(memory.createdAt || memory.updatedAt || "");
+    if (Number.isFinite(created) && (oldestMs === null || created < oldestMs)) oldestMs = created;
+    const updated = Date.parse(memory.updatedAt || "");
+    if (Number.isFinite(updated) && (newestMs === null || updated > newestMs)) newestMs = updated;
+  }
   return {
     file,
     exists: bytes > 0,
@@ -1858,8 +1892,8 @@ function buildStats(vault, key, file, bytes) {
     foreignLive: foreign.live,
     legacyGlobal: foreign.legacyGlobal,
     tags: tagHistogram(visible),
-    oldest: stamps.length ? new Date(Math.min(...stamps)).toISOString() : null,
-    newest: updated.length ? new Date(Math.max(...updated)).toISOString() : null,
+    oldest: oldestMs === null ? null : new Date(oldestMs).toISOString(),
+    newest: newestMs === null ? null : new Date(newestMs).toISOString(),
   };
 }
 
@@ -1922,7 +1956,9 @@ function parseImportPayload(text) {
     return { error: "OpenMind import: expected a memory_export object with a `memories` array, or a bare array." };
   }
   if (list.length > MAX_IMPORT_ENTRIES) {
-    return { error: `OpenMind import: payload has ${list.length} entries; the maximum per call is ${MAX_IMPORT_ENTRIES}.` };
+    // The real count is not echoed: it would disclose the length of a payload
+    // read from an arbitrary path.
+    return { error: `OpenMind import: the payload has too many entries; the maximum per call is ${MAX_IMPORT_ENTRIES}.` };
   }
   return { list };
 }
@@ -1950,10 +1986,17 @@ function planImport(list, { key, existing, ownedIDs, onConflict, reassignToCurre
       continue;
     }
     // Ownership: a record belongs here only if it was recorded against this
-    // project, or if it is a legacy global (restored faithfully, still global).
-    const owned = sanitized.scope !== "global" && sanitized.project === key;
-    const legacyGlobal = sanitized.scope === "global";
-    if (!owned && !legacyGlobal) {
+    // project. A payload cannot create a global record either: a global is
+    // owned by nobody, so it is invisible everywhere *and* it is the one kind
+    // of record another project's memory_reassign adopts in bulk. Accepting one
+    // from a payload would be a way to plant text that a different worktree
+    // later picks up, so globals are re-homed into the importing project - which
+    // is also the only way they become reachable at all.
+    if (sanitized.scope === "global") {
+      sanitized.scope = "project";
+      sanitized.project = key;
+      plan.adopted += 1;
+    } else if (sanitized.project !== key) {
       if (!reassignToCurrent) {
         plan.otherProjectSkipped += 1;
         continue;
@@ -2586,7 +2629,7 @@ let startupWarning = "";
               const memory = vault.entries.find(
                 (entry) => entry.id === args.id && visibleToProject(entry, projectKey(context)),
               );
-              if (!memory) return `No visible memory found with id ${args.id}.`;
+              if (!memory) return `No visible memory found with id ${cleanInline(args.id, 128)}.`;
               // Every field goes through the sanitizer: an update is a write
               // path too, and `source`/`tags` are rendered back to the model at
               // injection time, so an uncapped value must never reach the
@@ -2610,7 +2653,7 @@ let startupWarning = "";
                 pinned: args.pinned !== undefined ? Boolean(args.pinned) : memory.pinned,
                 updatedAt: now(),
               });
-              if (!updated) return `Memory ${args.id} could not be updated: the result would be empty.`;
+              if (!updated) return `Memory ${cleanInline(args.id, 128)} could not be updated: the result would be empty.`;
               Object.assign(memory, updated);
               await saveVault(file);
               return {
@@ -2747,7 +2790,7 @@ let startupWarning = "";
 
       memory_import: tool({
         description:
-          "Restore memories from a memory_export payload (JSON text or a file). Dry run by default: pass confirm: true to write. Every entry is re-sanitized and capped; entries recorded against another project are rejected unless reassignToCurrent is set, so a restore cannot seed another project's memory space. Conflicts are resolved by onConflict (skip by default). Imported entries get the `imported` tag, which marks them untrusted at injection time.",
+          "Restore memories from a memory_export payload (JSON text or a file). Dry run by default: pass confirm: true to write. Every entry is re-sanitized and capped; entries recorded against another project are rejected unless reassignToCurrent is set, so a restore cannot seed another project's memory space. Legacy global records are re-homed into this project (they belong to nobody, and leaving them global would make them invisible and bulk-adoptable by another project). onConflict is skip (default), overwrite or new-id; overwrite may only replace a record this project owns - a foreign id is always given a fresh id. Imported entries get the `imported` tag, which marks them untrusted at injection time.",
         args: {
           data: tool.schema.string().optional().describe("The JSON text produced by memory_export (or its `memories` array)."),
           file: tool.schema.string().optional().describe("Path to a file containing that JSON. Ignored if `data` is given."),
@@ -2769,15 +2812,14 @@ let startupWarning = "";
                 const target = args.file.trim().replace(/^~(?=$|[/\\])/, homedir());
                 try {
                   const info = await stat(target);
-                  if (!info.isFile()) return "OpenMind import: the given path is not a regular file.";
-                  if (info.size > MAX_IMPORT_BYTES) {
-                    return `OpenMind import: the file is ${formatBytes(info.size)}; the maximum per call is ${formatBytes(MAX_IMPORT_BYTES)}.`;
-                  }
+                  if (!info.isFile() || info.size > MAX_IMPORT_BYTES) throw new Error("unusable");
                   payload = await readFile(target, "utf8");
                 } catch {
-                  // One message for every failure mode: distinguishing missing,
-                  // unreadable and not-a-file turns this into a filesystem probe.
-                  return "OpenMind import: the payload file could not be read. Check that it exists and is a regular file of at most 8 MB.";
+                  // Exactly one message for every failure mode. Distinguishing
+                  // "missing" from "is a directory" from "too large" (with its
+                  // exact size) would turn this into a filesystem probe; the
+                  // caller only ever needs to know the file was not usable.
+                  return "OpenMind import: the payload file could not be read. Pass JSON via `data`, or point `file` at a readable backup of at most 8 MB.";
                 }
               } else {
                 return "OpenMind import: pass either `data` (JSON text) or `file` (a path to the JSON).";
@@ -2974,7 +3016,7 @@ async execute(args, context) {
               const index = vault.entries.findIndex(
                 (memory) => memory.id === args.id && visibleToProject(memory, projectKey(context)),
               );
-              if (index === -1) return `No visible memory found with id ${args.id}.`;
+              if (index === -1) return `No visible memory found with id ${cleanInline(args.id, 128)}.`;
               const [removed] = vault.entries.splice(index, 1);
               await saveVault(file);
               return {

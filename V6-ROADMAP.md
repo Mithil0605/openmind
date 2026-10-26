@@ -55,6 +55,25 @@ Two security decisions in this release are worth recording:
 - **Imported text is untrusted text.** It gets an `imported` tag, and the
   injection fence now treats `imported` like `listen`: sticky through
   `memory_update`, and framed as quoted data the model must not obey.
+- **Inline fields are sanitized, not just capped.** An independent red-team pass
+  found that `tags` and `createdAt`/`updatedAt` were the only import fields
+  rendered inline that were still stored verbatim, so a newline in either one
+  forged an extra line that looked like a memory owned by another project
+  (`- <uuid> [admin] pinned (project=/root/...)`) — the id-token rule protected
+  only ids. Tags and timestamps now have control characters, bidi overrides and
+  structural brackets/parentheses stripped, timestamps must parse and fit in 40
+  characters, and ids are rendered through the same cleaner. `pinned` must be a
+  real boolean.
+- **Import cannot create a global record.** A global belongs to no project, is
+  invisible everywhere, and is the one record kind another project's
+  `memory_reassign` adopts *in bulk*. Accepting one from a payload was therefore
+  a way to plant text a different worktree later picks up. Globals are re-homed
+  into the importing project, which is also the only way they become reachable.
+- **The file-read error is singular.** Directory, missing, unreadable and
+  oversized all return the same message with no real size, so `file` cannot be
+  used as a filesystem or file-size oracle. `memory_stats` no longer uses
+  `Math.min(...stamps)`, which threw a `RangeError` on stores above roughly
+  125k entries — i.e. exactly when the tool becomes useful.
 
 `@opencode-ai/plugin` also moved from `dependencies` to `devDependencies`. It was
 never imported by `index.js`, but it transitively pinned vulnerable `toml`/`zod`
