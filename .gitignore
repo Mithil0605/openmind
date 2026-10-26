@@ -12,3 +12,6 @@ __pycache__/
 *.log
 tmp/
 temp/
+
+# Local-only verification suites (not published)
+.tests-local/

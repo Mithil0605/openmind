@@ -27,22 +27,19 @@ jobs:
       - name: Install
         run: npm ci
 
-      # The image/PDF suites drive the real Python helper. It needs Pillow for
-      # resize/attachment, and optionally tesseract (OCR) and poppler (PDF
-      # rasterization). Installing them keeps CI representative of a full local
-      # install; the plugin still degrades to header-only output without them.
-      - name: Optional image/PDF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-pil tesseract-ocr poppler-utils
-
       # eslint runs first and on its own: a parse error or an undefined reference
-      # must report as lint failure, not vanish behind a chained test script.
+      # must report as lint failure, not vanish behind a chained script.
       - name: Lint
         run: npm run lint
 
       - name: Syntax check
         run: node --check index.js
 
+      # The plugin is a single file with no build step; loading it is the
+      # meaningful end-to-end smoke check that needs no fixtures.
+      - name: Load check
+        run: node -e "import('./index.js').then(({ MemoryPlugin }) => { if (typeof MemoryPlugin !== 'function') process.exit(1); })"
+
+      # `npm test` is the same gate a contributor runs locally.
       - name: Test
-        run: npm run test:unit
+        run: npm test

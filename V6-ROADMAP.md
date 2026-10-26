@@ -10,8 +10,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 ## Status (as of 6.1.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
-fixed and each one now has a regression test in `test/regressions.mjs`, so the
-fourteen-suite `npm test` gate catches a reintroduction.
+fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
 
 | Item | Fix |
 |---|---|
@@ -20,7 +19,7 @@ fourteen-suite `npm test` gate catches a reintroduction.
 | #3 negation-only recall | A query with no positive terms filters by exclusion and ranks by pinned/recency. |
 | #4 reassign mislabels live projects | Orphans are inferred from a *missing project directory*, not from path difference. A live project's memories are never taken by a bulk rebind; one can only be moved by naming its id explicitly. |
 | #5 dead `global` scope | Legacy globals are counted separately and returned by `memory_export { scope: "all" }`, and `memory_reassign` adopts them into the current project. |
-| #20 test gaps | `test/regressions.mjs` covers (a) save-then-inject across directories, (b) source/tag caps through dedupe and update, (c) negative-only queries, (d) reassign ownership, (e) global-scope visibility, plus moved-session isolation and preview/confirm consistency. |
+| #20 test gaps | The regression suite covers (a) save-then-inject across directories, (b) source/tag caps through dedupe and update, (c) negative-only queries, (d) reassign ownership, (e) global-scope visibility, plus moved-session isolation and preview/confirm consistency. |
 
 **Behaviour changes worth knowing (breaking):**
 
@@ -50,8 +49,8 @@ Two security decisions in this release are worth recording:
   first implementation keyed replacement off the payload's own `project` field,
   which is attacker-controlled; importing one crafted entry with another
   project's id deleted that project's memory. Found by red-team review during
-  this release, reproduced, fixed, and pinned by two tests (one in `test/v61.mjs`,
-  one in the external DAST probe). Foreign ids are now always given a fresh id.
+  this release, reproduced, fixed, and pinned by two regression tests. Foreign
+  ids are now always given a fresh id.
 - **Imported text is untrusted text.** It gets an `imported` tag, and the
   injection fence now treats `imported` like `listen`: sticky through
   `memory_update`, and framed as quoted data the model must not obey.

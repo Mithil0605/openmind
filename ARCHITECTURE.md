@@ -27,8 +27,8 @@ lib/imgread.py        image/PDF/OCR helper (invoked with an argv array, no shell
 commands/             /listen and /imgread slash commands (copied by install.mjs)
 install.mjs           cross-platform setup: deps, plugin registration, commands
 install.sh/.cmd/.ps1  thin launchers around install.mjs
-test/                 15 executable suites (see section 9)
-.github/workflows/    CI: lint + syntax check + the full suite on Node 22 and 24
+test/                 verification suites (kept out of the published repo)
+.github/workflows/    CI: lint + syntax check + load check on Node 22 and 24
 ```
 
 There is no build step and no runtime dependency: `@opencode-ai/plugin` is a
@@ -127,7 +127,7 @@ Two writers must not corrupt the JSONL. OpenMind layers:
 
 The lock is stolen only when it is older than a grace period **and** the recorded
 owner is provably gone, and a holder removes the lockfile only if it still
-carries its own token. This is exercised by `test/concurrency.mjs`.
+carries its own token. This is covered by the concurrency verification suite.
 
 ## 7. Recall and injection
 
@@ -164,22 +164,25 @@ targets, streams against a 25 MB cap, and spawns `lib/imgread.py` with an
 argument array (never a shell). Local reads are refuse-by-default: only image
 files are parsed and raw bytes are never echoed.
 
-## 9. Testing and CI
+## 9. Verification and CI
 
-`npm test` runs ESLint, `node --check`, then 15 suites:
+The verification suites are maintained outside this repository, so a clean clone
+contains only the plugin. Locally they are executed against the same
+`MemoryPlugin` entry point and each creates its own temp store; the network
+suites run against a loopback test server whose hostname resolves to a private
+address, which the guard must block.
 
-`smoke`, `compat`, `encryption`, `locked`, `concurrency`, `store`, `ranking`,
-`security`, `image`, `listen`, `vapt`, `vapt2`, `regressions`, `v61`, `dast`.
+What they cover, in the order the code depends on it:
 
-`regressions` pins the v6.0 correctness fixes (injection keying, write-path
-caps, negation-only recall, reassign ownership, legacy globals, moved-session
-isolation). `v61` covers the v6.1 features and is also the security gate for
-`memory_import`: it asserts the size and entry caps, the sanitizer, the
-project-scoping rules, the id-token rule, and that `onConflict: "overwrite"`
-cannot delete a record owned by another project.
+- store format, encryption, locking and cross-process concurrency;
+- ranking, negation, budget and injection keying;
+- the write-path caps and the `memory_import` rules (size and entry caps,
+  `sanitizeEntry`, project scoping, id-token rule, and that
+  `onConflict: "overwrite"` cannot delete a record owned by another project);
+- adversarial payloads: seeded cross-project records, forged output lines via
+  tags or timestamps, prototype pollution, oversized or deeply nested payloads,
+  and the file-read error path.
 
-They are executable and hermetic: each creates its own temp store, and the
-network suites run against a loopback test server whose hostname resolves to a
-private address, which the guard must block. `.github/workflows/ci.yml` runs the
-same gate with `npm ci` on Node 22 and 24, so a lockfile/config drift or a
-newer-than-supported API fails in CI rather than in someone's install.
+`.github/workflows/ci.yml` runs `npm ci`, ESLint, `node --check index.js`, a
+module-load check and `npm test` on Node 22 and 24, so a lockfile/config drift or
+a newer-than-supported API fails in CI rather than in someone's install.

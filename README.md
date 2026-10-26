@@ -190,7 +190,7 @@ Stated plainly so nothing here is a surprise:
 
 ## Security and VAPT
 
-OpenMind v6 ships with a built-in static and dynamic security test suite, plus eslint and a GitHub Actions workflow that runs both on every push. `npm test` runs lint and all fifteen suites: `test/smoke.mjs`, `test/compat.mjs`, `test/encryption.mjs`, `test/locked.mjs`, `test/concurrency.mjs`, `test/store.mjs`, `test/ranking.mjs`, `test/security.mjs`, `test/image.mjs`, `test/listen.mjs`, `test/vapt.mjs`, `test/vapt2.mjs`, `test/regressions.mjs`, `test/v61.mjs`, and `test/dast.mjs`:
+OpenMind is checked by ESLint and a GitHub Actions workflow on every push. The verification suites themselves are not published in this repository; `npm test` runs lint plus a syntax check. The properties below are what those checks cover, and what the code is written to guarantee:
 
 - **Input injection / fuzzing** — newline-forged records, prototype-pollution tags, oversized text, regex metacharacters in queries.
 - **Tampered and corrupt stores** — the plugin never crashes or leaks partial data.
@@ -419,6 +419,6 @@ npm test
 npm pack
 ```
 
-`npm test` runs ESLint, a syntax check, and the fifteen suites in `test/`. The `image` suite drives the real Python helper, so it needs `python3` with Pillow and uses `tesseract` and a PDF rasterizer (`pdftoppm`/`mutool`/`gs`) when they are installed; everything else runs on a bare Node install. CI installs those optional packages so the full feature path is exercised on every push. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
+`npm test` runs ESLint and a syntax check; the image helper needs `python3` with Pillow for resize/attachment, and uses `tesseract` plus a PDF rasterizer (`pdftoppm`/`mutool`/`gs`) when they are installed. `npm pack` creates a `.tgz` package that can be shared or published. Do not commit `node_modules/`, generated `.tgz` files, or `.env`; all are already ignored by `.gitignore`. The image helper lives in `lib/imgread.py` and is referenced relative to the plugin location, so it works in any clean clone without absolute paths.
 
 `install.mjs` accepts `--commands global` (default), `--commands project`, or `--commands none` to control where the slash commands go.

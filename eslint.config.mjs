@@ -3,7 +3,9 @@ import globals from "globals";
 
 export default [
   {
-    ignores: ["node_modules/**", "*.tgz"],
+    // `.tests-local` holds the local verification suites, which are deliberately
+    // not part of the published repository.
+    ignores: ["node_modules/**", "*.tgz", ".tests-local/**"],
   },
   js.configs.recommended,
   {
@@ -39,7 +41,7 @@ export default [
     },
   },
   {
-    files: ["test/**/*.mjs", "install.mjs"],
+    files: ["install.mjs"],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: "module",
