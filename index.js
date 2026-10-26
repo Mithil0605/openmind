@@ -1539,10 +1539,12 @@ async function ensureLoaded(file, autoPassword) {
 
 async function saveVault(file) {
   const vault = getVault(file);
-  // Every mutation path ends here (the O(1) append shortcut included, via its
-  // caller), so this is the single place the derived search index is dropped.
-  // Rebuilding it is lazy: the next recall pays for it once.
+  // Every rewriting mutation path ends here, so this is the single place the
+  // derived search index is dropped (the O(1) append shortcut drops it itself).
+  // Rebuilding is lazy: the next recall pays for it once. The "too large"
+  // refusal is cleared too, because the store may have shrunk.
   vault.index = null;
+  vault.indexDisabled = false;
   if (vault.mode === "encrypted") {
     if (!vault.password) throw new Error("OpenMind: cannot write the encrypted store without its password.");
     const salt = await writeEncrypted(file, vault.password, vault.entries, {
@@ -1741,29 +1743,7 @@ function bm25Documents(entries, tokens) {
   const k1 = 1.5;
   const b = 0.75;
   const n = entries.length;
-  const docs = entries.map((entry) => {
-    const counts = new Map();
-    const unique = new Set();
-    const add = (words, weight) => {
-      for (const raw of words) {
-        if (!raw) continue;
-        counts.set(raw, (counts.get(raw) || 0) + weight);
-        unique.add(raw);
-        const folded = stem(raw);
-        if (folded !== raw) {
-          // The stem carries slightly less weight so an exact term still wins.
-          counts.set(folded, (counts.get(folded) || 0) + Math.max(1, weight - 1));
-          unique.add(folded);
-        }
-      }
-    };
-    const textWords = tokenize(entry.text);
-    const tagWords = tokenize((entry.tags || []).join(" "));
-    add(textWords, FIELD_WEIGHTS.text);
-    add(tagWords, FIELD_WEIGHTS.tags);
-    add(tokenize(entry.source), FIELD_WEIGHTS.source);
-    return { entry, counts, unique, length: textWords.length + tagWords.length };
-  });
+  const docs = entries.map((entry) => ({ entry, ...documentStats(entry) }));
   const avgLen = n ? docs.reduce((sum, doc) => sum + doc.length, 0) / n : 0;
   const df = new Map();
   for (const doc of docs) for (const term of doc.unique) df.set(term, (df.get(term) || 0) + 1);
@@ -1797,6 +1777,199 @@ function bm25Documents(entries, tokens) {
       }
     }
     return { entry: doc.entry, unique: doc.unique, score };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// v6.2: inverted index (#12)
+//
+// Recall used to re-tokenize and re-stem every memory on every call, then scan
+// the whole vocabulary for prefix and fuzzy expansion. On a large store that is
+// the dominant cost, paid again for every question.
+//
+// The index is a per-entry token bag plus a term -> entries postings map, built
+// once per store version and dropped by saveVault() whenever the store changes.
+// It is deliberately NOT a SQLite/FTS5 index on disk:
+//
+//   - an on-disk plaintext index would leak memory text for encrypted stores,
+//     and putting it inside the ciphertext means re-encrypting it on every write;
+//   - a stale or corrupt index file is a new failure mode with a new recovery
+//     path, for a store whose failure mode is "the user's memories are gone";
+//   - this codebase's ranking is not plain BM25. It indexes each token verbatim
+//     and stemmed, weights fields, and scores against the *filtered* subset, so
+//     an external engine's ranking would silently change results.
+//
+// bm25Documents() stays as the reference implementation: the parity test asserts
+// both paths return byte-identical results, and any store too large to index
+// falls back to it.
+// ---------------------------------------------------------------------------
+
+// Above these bounds the postings map itself is the memory cost, so the scanner
+// is the safer choice. The entry cap catches many small memories; the postings
+// cap catches few but very large ones (a memory can hold 8000 characters, and a
+// store of those would otherwise index millions of distinct terms).
+const INDEX_MAX_DOCS = 20000;
+const INDEX_MAX_POSTINGS = 2000000;
+
+// The per-entry token bag. Shared by the index and the fallback scorer so both
+// compute counts, unique terms and document length the same way.
+function documentStats(entry) {
+  const counts = new Map();
+  const unique = new Set();
+  const add = (words, weight) => {
+    for (const raw of words) {
+      if (!raw) continue;
+      counts.set(raw, (counts.get(raw) || 0) + weight);
+      unique.add(raw);
+      const folded = stem(raw);
+      if (folded !== raw) {
+        // The stem carries slightly less weight so an exact term still wins.
+        counts.set(folded, (counts.get(folded) || 0) + Math.max(1, weight - 1));
+        unique.add(folded);
+      }
+    }
+  };
+  const textWords = tokenize(entry.text);
+  const tagWords = tokenize((entry.tags || []).join(" "));
+  add(textWords, FIELD_WEIGHTS.text);
+  add(tagWords, FIELD_WEIGHTS.tags);
+  add(tokenize(entry.source), FIELD_WEIGHTS.source);
+  return { counts, unique, length: textWords.length + tagWords.length };
+}
+
+function buildMemoryIndex(entries, maxPostings = INDEX_MAX_POSTINGS) {
+  const docs = new Map();
+  const postings = new Map();
+  let postingCount = 0;
+  for (const entry of entries) {
+    const doc = documentStats(entry);
+    postingCount += doc.unique.size;
+    // Bail out instead of building an index that would cost more memory than the
+    // store it describes. The caller falls back to the scanner.
+    if (postingCount > maxPostings) return null;
+    docs.set(entry, doc);
+    for (const term of doc.unique) {
+      let bucket = postings.get(term);
+      if (!bucket) {
+        bucket = new Set();
+        postings.set(term, bucket);
+      }
+      bucket.add(entry);
+    }
+  }
+  // Sorted once, so a prefix expansion is a binary search plus a short walk
+  // instead of a full vocabulary scan.
+  return { docs, postings, terms: [...postings.keys()].sort(), builtAt: Date.now() };
+}
+
+function lowerBound(list, value) {
+  let low = 0;
+  let high = list.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (list[mid] < value) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function ensureIndex(vault) {
+  if (vault.index) return vault.index;
+  // Remember a refusal for this store version: without it, every recall and
+  // every injection pass would retry a build that is known to be too large.
+  if (vault.indexDisabled) return null;
+  if (vault.entries.length > INDEX_MAX_DOCS) {
+    vault.indexDisabled = true;
+    return null;
+  }
+  vault.index = buildMemoryIndex(vault.entries);
+  if (!vault.index) vault.indexDisabled = true;
+  return vault.index;
+}
+
+// Recall only needs the index when there is something to rank. A plain listing
+// and a negation-only query ("-windows") never read a score, so building the
+// index for them would cost more than it saves.
+function recallIndex(vault, args) {
+  const positive = String(args?.query || "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term && !term.startsWith("-"));
+  if (!positive.length) return null;
+  return ensureIndex(vault);
+}
+
+// Same scoring as bm25Documents, over the candidate set only.
+//
+// Correctness note: n and avgLen are still taken over the whole filtered subset
+// (they are cheap with cached lengths), and df is taken over the candidates.
+// Those are equivalent for every term that can score: a term's document
+// frequency only counts documents that contain it, and every document that
+// contains any expansion of a query term is a candidate by construction. So the
+// numbers - and therefore the ranking - are identical to the full scan.
+function bm25WithIndex(index, subset, tokens) {
+  const k1 = 1.5;
+  const b = 0.75;
+  const n = subset.length;
+  const docFor = (entry) => index.docs.get(entry) || documentStats(entry);
+
+  // A negation-only query has nothing to rank by. Every entry still has to come
+  // back with its token set so the exclusion filter can run, exactly as the full
+  // scan would return them.
+  if (!tokens.length) {
+    return subset.map((entry) => ({ entry, unique: docFor(entry).unique, score: 0 }));
+  }
+
+  const expansions = new Map();
+  const candidates = new Set();
+  for (const term of tokens) {
+    const forms = [...new Set([term, stem(term)])];
+    const matches = new Set(forms);
+    if (term.length >= 3) {
+      for (let i = lowerBound(index.terms, term); i < index.terms.length && index.terms[i].startsWith(term); i += 1) {
+        matches.add(index.terms[i]);
+      }
+    }
+    if (term.length >= 5) {
+      for (const candidate of index.terms) {
+        if (matches.has(candidate)) continue;
+        if (Math.abs(candidate.length - term.length) > 1) continue;
+        if (withinEditDistance(term, candidate, 1)) matches.add(candidate);
+      }
+    }
+    const variants = [...matches].filter((variant) => index.postings.has(variant));
+    expansions.set(term, variants);
+    for (const variant of variants) {
+      for (const entry of index.postings.get(variant)) candidates.add(entry);
+    }
+  }
+
+  // Preserve the subset's order: ties are broken by sort stability downstream,
+  // so the candidate order has to match what the full scan would have produced.
+  const relevant = subset.filter((entry) => candidates.has(entry));
+  let totalLength = 0;
+  for (const entry of subset) totalLength += docFor(entry).length;
+  const avgLen = n ? totalLength / n : 0;
+
+  const df = new Map();
+  for (const entry of relevant) {
+    for (const term of docFor(entry).unique) df.set(term, (df.get(term) || 0) + 1);
+  }
+  const idf = (term) => (df.has(term) ? Math.log(1 + (n - df.get(term) + 0.5) / (df.get(term) + 0.5)) : 0);
+
+  return relevant.map((entry) => {
+    const doc = docFor(entry);
+    let score = 0;
+    for (const term of tokens) {
+      for (const variant of expansions.get(term) || [term]) {
+        const freq = doc.counts.get(variant) || 0;
+        if (!freq) continue;
+        const exact = variant === term ? 1 : variant.startsWith(term) ? 0.6 : 0.75;
+        const denominator = freq + k1 * (1 - b + (b * doc.length) / (avgLen || 1));
+        score += (idf(variant) * freq * (k1 + 1) * exact) / denominator;
+      }
+    }
+    return { entry, unique: doc.unique, score };
   });
 }
 
@@ -1870,7 +2043,7 @@ function inTimeWindow(memory, window) {
   return true;
 }
 
-function filterMemories(memories, key, args = {}) {
+function filterMemories(memories, key, args = {}, index = null) {
   const tags = asArray(args.tags);
   const rawQuery = String(args.query || "").trim();
   const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
@@ -1900,9 +2073,10 @@ function filterMemories(memories, key, args = {}) {
       .slice(0, limit);
   }
 
-  // bm25Documents returns both the score and each entry's token set, so negation
-  // filtering does not have to re-tokenize every entry a second time.
-  const scored = bm25Documents(tagged, positive);
+  // Both scorers return the score and each entry's token set, so negation
+  // filtering does not have to re-tokenize every entry a second time. The index
+  // path only narrows which documents are scored: it produces the same numbers.
+  const scored = index ? bm25WithIndex(index, tagged, positive) : bm25Documents(tagged, positive);
   const kept = scored.filter((doc) =>
     negative.every((term) => {
       if (doc.unique.has(term)) return false;
@@ -2046,6 +2220,9 @@ function buildStats(vault, key, file, bytes) {
     // lazily by the first recall), otherwise the number of indexed documents.
     indexDocs: vault.index ? vault.index.docs.size : -1,
     indexTerms: vault.index ? vault.index.terms.length : -1,
+    // A store too large to index is not "not built yet"; it will never be built
+    // for this version, so saying so avoids a misleading "first recall builds it".
+    indexLimited: Boolean(vault.indexDisabled),
   };
 }
 
@@ -2066,6 +2243,8 @@ function formatStats(stats, key) {
   }
   if (stats.indexDocs >= 0) {
     lines.push(`  search index: ${stats.indexDocs} document(s), ${stats.indexTerms} term(s), in memory`);
+  } else if (stats.indexLimited) {
+    lines.push("  search index: disabled for this store (too large; using the scanner)");
   } else {
     lines.push("  search index: not built yet (first recall builds it)");
   }
@@ -2254,12 +2433,18 @@ function budgetMemories(memories, { limit, maxChars, itemMaxChars }) {
 // current user message, then recency. Without the relevance step the same fixed
 // set is injected every turn forever, so a memory about a topic the user is not
 // working on keeps crowding out one they are.
-function orderForInjection(memories, query) {
+function orderForInjection(memories, query, index = null) {
   const terms = [...new Set(stemAll(tokenize(query)))].filter((term) => term.length >= 2);
   const relevance = new Map();
   if (terms.length) {
     for (const memory of memories) {
-      const tokens = new Set(stemAll(tokenize(`${memory.text} ${(memory.tags || []).join(" ")}`)));
+      // The index already holds the raw+stemmed token bag for this entry, which
+      // is exactly the set computed below - reuse it instead of re-tokenizing
+      // every visible memory on every turn.
+      const cached = index?.docs.get(memory);
+      const tokens = cached
+        ? cached.unique
+        : new Set(stemAll(tokenize(`${memory.text} ${(memory.tags || []).join(" ")}`)));
       let hits = 0;
       for (const term of terms) if (tokens.has(term)) hits += 1;
       // Zero-hit memories stay at 0, so a memory that is simply irrelevant can
@@ -2745,7 +2930,14 @@ let startupWarning = "";
       }
       if (!outcome.updated && vault.mode === "plaintext") {
         const appended = await appendPlaintextLine(file, outcome.memory);
-        if (appended) vault.mtimeMs = (await stat(file)).mtimeMs;
+        if (appended) {
+          vault.mtimeMs = (await stat(file)).mtimeMs;
+          // Appending bypasses saveVault, which is where the index is normally
+          // dropped; without this the new memory would be missing from recall
+          // until something else rewrote the store.
+          vault.index = null;
+          vault.indexDisabled = false;
+        }
         else await saveVault(file);
       } else {
         await saveVault(file);
@@ -2866,7 +3058,7 @@ let startupWarning = "";
               const vault = getVault(file);
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
-              const memories = filterMemories(vault.entries, projectKey(context), args);
+              const memories = filterMemories(vault.entries, projectKey(context), args, recallIndex(vault, args));
               if (!Array.isArray(memories)) return memories.error;
               return memories.length ? memories.map(formatMemory).join("\n") : "No matching memories found.";
             }),
@@ -2943,6 +3135,7 @@ let startupWarning = "";
                   pendingMigrations: stats.pendingMigrations,
                   indexDocs: stats.indexDocs,
                   indexTerms: stats.indexTerms,
+                  indexLimited: stats.indexLimited,
                 },
               };
             }),
@@ -3704,7 +3897,7 @@ async execute(args, context) {
         refusal = storeRefusal(vault);
         if (refusal) return null;
         const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
-        return budgetMemories(orderForInjection(visible, lastUserMessageText), {
+        return budgetMemories(orderForInjection(visible, lastUserMessageText, ensureIndex(vault)), {
           limit: injectLimit,
           maxChars: injectMaxChars,
           itemMaxChars: injectItemMaxChars,
@@ -3872,4 +4065,14 @@ export {
   KDF_PARAMS,
   LEGACY_KDF_PARAMS,
   STORE_VERSION,
+  // v6.2 search index: exported so the parity suite can assert the indexed
+  // scorer and the full scan return identical results, and that document
+  // statistics never drift between the two.
+  buildMemoryIndex,
+  bm25WithIndex,
+  documentStats,
+  ensureIndex,
+  recallIndex,
+  INDEX_MAX_DOCS,
+  INDEX_MAX_POSTINGS,
 };

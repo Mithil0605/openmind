@@ -106,10 +106,15 @@ into a readable tool result instead of breaking the turn.
 - **Scope** — project-only. A memory's `project` field is a hash of the
   worktree path (or `ns:<name>` when a namespace is set); every read filters on
   exact match. There is deliberately no global or session scope.
-- **Format** — one JSON object per line. Plaintext is the default; an
-  encrypted store begins with `OPENMIND_ENC_V3`, an `scrypt` parameter line, and
-  `salt:iv:authTag:ciphertext` (AES-256-GCM). Plaintext lines that are not
-  valid JSON are parsed as legacy records or skipped, never trusted.
+- **Format** — versioned JSONL (`STORE_VERSION = 6`). The first line is a
+  marker, `{"openmind":6}`, followed by one JSON object per line. Encrypted
+  stores begin with `OPENMIND_ENC_V3`, an `scrypt` parameter line, and
+  `salt:iv:authTag:ciphertext` (AES-256-GCM) whose plaintext is
+  `{"openmind":6,"entries":[...]}`. The version is known *before* entries are
+  parsed, which is what makes refusal possible: a store declaring a version this
+  build does not know is left byte-identical by every reader and writer.
+  Plaintext lines that are not valid JSON are parsed as legacy records or
+  skipped, never trusted.
 - **Atomicity** — writes go through `writeAtomic` (temp file + `rename`), which
   also replaces a symlink rather than writing through it. Plaintext appends use
   an O(1) fast path with a defensive rewrite fallback.
@@ -117,6 +122,13 @@ into a readable tool result instead of breaking the turn.
   SHA-256 of the password, and cleared when the password changes or the store is
   deleted. Password files must be `0600` regular files ≤ 4096 bytes, and every
   rejection reports the same message so the tool cannot probe a path.
+
+- **Migrations** — `STORE_MIGRATIONS` is an ordered ladder of named steps
+  (v5 plaintext → v6 on next write, v5 encrypted → v6 on first successful
+  decrypt, legacy v2 KDF → v6 on load). `pendingStoreMigrations` reports what a
+  store would still need, and `memory_stats` surfaces it. Each reader and writer
+  checks `storeRefusal` first, so an unsupported store fails closed at every
+  entry point instead of at the one that happened to parse it.
 
 ## 6. Concurrency
 
@@ -135,12 +147,27 @@ carries its own token. This is covered by the concurrency verification suite.
   terms match verbatim or stemmed, by prefix, or with one edit inside words of
   five or more characters. Negated `-terms` exclude. The recorded project path is
   never indexed, so a query naming the directory does not match everything.
+- **Index** — an in-memory inverted index (`buildMemoryIndex`) caches per-entry
+  token bags and a term → entries postings map. It is built lazily on the first
+  ranking recall (or the first injection pass), reused for the life of that store
+  version, and dropped by `saveVault` and by the plaintext append shortcut. It
+  narrows *which* documents are scored, never *how*: `bm25Documents` remains the
+  reference scorer, the indexed path is asserted byte-identical by the
+  differential test, and stores above `INDEX_MAX_DOCS` entries or
+  `INDEX_MAX_POSTINGS` terms use the scanner (the refusal is sticky for that
+  store version, so it is not retried on every turn). There is
+  no on-disk index, so it cannot leak plaintext from an encrypted store and
+  cannot outlive the data it describes.
 - **Injection** — pinned first, then relevance to the last user message, then
   recency, bounded by `injectLimit` (count), `injectMaxChars` (total) and
   `injectItemMaxChars` (per entry). Each memory is clipped before the budget is
   spent, and an entry that does not fit is skipped rather than ending the pass.
   Web-derived memories are fenced and tagged `listen`, and carry an UNTRUSTED
-  warning that survives later tag updates.
+  warning that survives later tag updates. When anything was considered, a
+  one-line provenance footer is appended *outside* the fence (count injected, of
+  how many considered, how many the budget dropped) so a silent zero-injection
+  is observable; it is enabled by default and can be disabled with
+  `injectionFooter: false` / `OPENMIND_INJECTION_FOOTER=0`.
 
 ## 8. Network I/O guards
 
@@ -175,7 +202,12 @@ address, which the guard must block.
 What they cover, in the order the code depends on it:
 
 - store format, encryption, locking and cross-process concurrency;
+- version headers and migrations, including refusing a store written by a newer
+  build without touching it, and header-shaped memory text that must not forge
+  store structure;
 - ranking, negation, budget and injection keying;
+- search-index parity (a randomized differential against the reference scanner),
+  invalidation on every write path, and the oversized-store fallback;
 - the write-path caps and the `memory_import` rules (size and entry caps,
   `sanitizeEntry`, project scoping, id-token rule, and that
   `onConflict: "overwrite"` cannot delete a record owned by another project);

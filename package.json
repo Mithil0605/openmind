@@ -1,6 +1,6 @@
 {
   "name": "openmind-v5",
-  "version": "6.1.0",
+  "version": "6.2.0",
   "type": "module",
   "description": "Privacy-first, user-controlled memory tools for OpenCode V2 — project-scoped BM25 recall, SSRF-hardened web listening, image/PDF reading with OCR, and optional AES-256-GCM encryption. No session persistence.",
   "main": "index.js",

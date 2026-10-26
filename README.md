@@ -129,7 +129,7 @@ Windows example:
 - `memory_recall`: search memories with BM25-style ranking; prefix a token with `-` to exclude memories containing it (a query made only of exclusions still returns the project's other memories, ordered by pin and recency). Narrow by time with `last` (`7d`), `after` or `before`
 - `memory_list`: list recent memories; accepts the same `last` / `after` / `before` window
 - `memory_tags`: list the tags in use for this project, most frequent first, with counts — the fastest way to find the vocabulary before a tagged recall
-- `memory_stats`: report store health and shape: path, encryption state, size, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, and a tag histogram. It distinguishes an empty store from a locked one from memories stranded under another project path
+- `memory_stats`: report store health and shape: path, encryption state, size, store format and pending migrations, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, tag histogram, and whether the search index is built (document and term counts). It distinguishes an empty store from a locked one from memories stranded under another project path
 - `memory_unlock`: verify the store password to enable encryption or access an encrypted store (5-attempt rate limit). Takes `passwordFile` (preferred) or `password`
 - `memory_forget`: permanently delete a memory by id
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag
@@ -149,6 +149,14 @@ Ranking is BM25 over a weighted bag: text counts more than tags, tags more than 
 - a one-character typo in words of five or more characters still matches (`webhok` → `webhook`), scored lower than an exact hit.
 
 `memory_recall` only ever returns memories belonging to the current worktree.
+
+Token bags and a term-to-memory index are built in memory on first need and
+dropped whenever the store changes, so a query scores only the memories that
+contain one of its terms. The index is an accelerator, not a second source of
+truth: ranking is unchanged, the plain scanner is kept as the reference
+implementation for the tests, and a store too large to index (over 20,000
+entries, or over 2,000,000 indexed terms) uses the scanner instead of paying the
+memory cost. `memory_stats` says which mode is in use.
 
 ## Image Reading
 
@@ -357,7 +365,23 @@ Each memory is clipped to `injectItemMaxChars` before the budget is spent, so se
 
 Selection order is pinned first, then relevance to the current user message (keyword overlap, stemmed both sides), then most recently updated. Without the relevance step the same fixed set would be injected on every turn forever.
 
+Whenever at least one memory was considered, one line is appended *outside* the memory fence:
+
+```
+[OpenMind: injected 2 of 5 saved memories for ~/project, 3 not shown (budget).]
+```
+
+It is plain system text, not quoted memory content, so it cannot be used to smuggle anything into the fence. It exists because a silent injection failure is indistinguishable from an empty store: a full budget, a dropped set and nothing saved all used to look the same from the outside. A project with no saved memories stays silent. Turn it off with `"injectionFooter": false` or `OPENMIND_INJECTION_FOOTER=0`.
+
 ## Storage
+
+### File format
+
+The store is JSONL. Its first line is a version marker (`{"openmind":6}`), followed by one JSON record per line. Encrypted stores wrap the same envelope in the ciphertext instead, so a reader always knows the format before parsing entries.
+
+Upgrades happen automatically and in place: a v5 plaintext store gains the marker on its next write, a v5 encrypted store is upgraded on the first successful unlock, and the legacy v2 key-derivation format is migrated on load. `memory_stats` reports the current format and any pending migrations.
+
+A store written by a *newer* plugin is refused rather than parsed: every tool returns a short "newer format" message, and the file is left byte-identical. Best-effort parsing of an unknown format would drop fields and then save the truncated result, which is how memory gets silently destroyed by a downgrade.
 
 Default memory file locations:
 

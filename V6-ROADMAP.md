@@ -7,7 +7,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
-## Status (as of 6.1.0)
+## Status (as of 6.2.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -32,8 +32,8 @@ fixed and each one is pinned by a regression test, so a reintroduction is caught
   `scope` and a cross-project `warning` field. It is a recovery/diagnostic escape
   hatch, not the normal migration path.
 
-**Shipped in 6.1.0 — P1 #6 (`memory_import`) and P3 #17/#18 (partially), plus
-features the audit implied but did not list.** All four are agent-facing: they
+**Shipped in 6.1.0 — P1 #6 (`memory_import`) and P3 #17, plus features the audit
+implied but did not list.** (#18, injection transparency, landed in 6.2.0.) All four are agent-facing: they
 answer "what do I actually have in memory, and how do I get it back?".
 
 | Feature | Tool | Why it matters |
@@ -98,13 +98,46 @@ versions into every user install; `npm audit --omit=dev` is now clean, and
 5. **`useSessionProject` is not configurable.** The instance project always wins; a
    user who deliberately moves a session to another checkout gets the old project's
    memories. A documented option would make that intentional rather than surprising.
-6. **Injection transparency (#18).** A one-line provenance footer (how many
-   memories were injected, how many the budget dropped) is still missing. It is the
-   cheapest remaining observability win, but it adds noise to every prompt, so it
-   needs a config toggle to be worth shipping.
-7. **FTS5 (#12) is now 6.2 work.** It did not make 6.1: it touches storage, the
-   encrypted-store path, and the BM25 tests at once, and the released features did
-   not need it.
+6. **Injection transparency, store versioning and the index** are no longer
+   open: they shipped in 6.2.0 (below).
+
+**Shipped in 6.2.0 — P2 #16 (store format + migrations), #18 (injection
+transparency) and #12 (search index).** This release is about making the store
+inspectable and recall cheaper without changing a single ranking result.
+
+| Feature | Where | Why it matters |
+|---|---|---|
+| Versioned store | `index.js` (`STORE_VERSION`, `packStoreBody`, `STORE_MIGRATIONS`) | The JSONL format is now self-describing: a plaintext marker line, or an `entries` envelope inside the ciphertext. A reader can tell "current", "older but upgradeable" and "written by a newer plugin" apart *before* it parses entries. |
+| Migration ladder | `pendingStoreMigrations`, `upgradeVault` | v5 plaintext, v5 encrypted and legacy-v2-KDF files all upgrade on load/next write, and `memory_stats` reports what is pending. Each step is one named function, so the next format bump does not become a rewrite. |
+| Future-version refusal | `storeRefusal` at every guard site | A store that declares a version this build does not know is left **byte-identical** — no read, no write, no migration. The alternative (best-effort parsing) silently drops fields and then saves the truncated result. |
+| Injection footer | `memoryFooter`, `injectionFooter` option | One line, outside the memory fence: `[OpenMind: injected 2 of 5 saved memories for ~/project, 3 not shown (budget).]` It distinguishes "nothing saved", "everything dropped" and "injected" instead of showing silence for all three. Emitted only when something was considered, and only when `considered > 0`. |
+| Search index | `buildMemoryIndex`, `bm25WithIndex`, `ensureIndex` | Token bags and a term → entries postings map, built once per store version and dropped by `saveVault` (and by the plaintext append shortcut). Prefix expansion becomes a binary search; scoring touches only documents that contain a query expansion. `memory_stats` reports `indexDocs` / `indexTerms`. |
+
+### #12 was implemented without SQLite, deliberately
+
+The roadmap said "SQLite/FTS5". The released design is an in-memory inverted
+index, because FTS5 was the wrong tool for this store:
+
+- **It would leak plaintext.** An index has to be readable to be useful, so an
+  on-disk index next to an encrypted store would contain the memory text in the
+  clear. Putting the index inside the ciphertext means re-encrypting and rewriting
+  the entire index on every single save — worse than the scan it replaces.
+- **It adds a corruption path to the one file that must not corrupt.** A stale or
+  half-written index is a new failure mode with a new recovery story, for a store
+  whose worst case is "the user's memories are gone". The in-memory index cannot
+  outlive the data it describes.
+- **`node:sqlite` is experimental and version-gated**, so the plugin's only real
+  dependency would become the Node build the user happens to run.
+- **The ranking is not plain BM25.** This code indexes each token verbatim *and*
+  stemmed, weights text/tags/source differently, and scores against the
+  *filtered* subset (tag/window/visibility filters first, so `n`, `avgLen` and
+  `df` are subset-relative). FTS5's `bm25()` would silently change results.
+
+The index keeps the observable contract exactly: `bm25Documents` is retained as
+the reference implementation, `bm25WithIndex` narrows which documents are scored
+(never how they are scored), and the differential test asserts identical entries,
+order and scores across 400+ generated queries. Stores above `INDEX_MAX_DOCS`
+fall back to the scanner rather than doubling their memory footprint.
 
 ---
 
@@ -330,6 +363,6 @@ each historical fixture and asserts the v6 result.
 |---|---|---|
 | **v6.0 (correctness)** — shipped | P0 #1–#5 + regression tests #20 | The store works; the *feature* does not. Ship the injection fix first — it is the difference between "OpenMind remembers" and "OpenMind saves". |
 | **v6.1 (visibility + restore)** — shipped | #6 `memory_import`, #17 `memory_stats`, tag inventory, time windows, `imported` trust tag | Restores what export could only back up, and answers "what is actually in memory?" without reading the JSONL. |
-| **v6.2 (index)** | P2 #12 (SQLite/FTS5) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
+| **v6.2 (index)** — shipped | P2 #12 (inverted index, not FTS5 — see above) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index, and makes the store self-describing. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
 | **v6.3 (scope + lifecycle)** | #7 stable project identity, #5 global scope done properly, #8 caps/TTL + export cap, #9 agent scope | Fixes the family of "which project does this belong to" problems at the root instead of patching the symptom. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
