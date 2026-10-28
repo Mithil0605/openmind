@@ -2108,27 +2108,38 @@ function filterMemories(memories, key, args = {}, index = null) {
     .map(({ entry }) => entry);
 }
 
-// Ids are rendered through cleanInline even though the store's own ids are
-// UUIDs: a hand-edited store or a pre-validation import could otherwise put a
-// newline in one and forge a line that looks like a separate memory.
+// Short IDs for human display. Full IDs are always accepted by mutators; we
+// only truncate for readability in lists/recall/results.
+function shortId(id) {
+  const s = cleanInline(String(id || ""), 128);
+  if (s.length <= 12) return s;
+  return `${s.slice(0, 8)}…${s.slice(-4)}`;
+}
+
+// A stable scope label used in results so it's always clear what project
+// namespace a memory belongs to.
+function scopeLabel(memory) {
+  if (memory.scope === "project") {
+    const p = compactProject(memory.project) || "(unknown)";
+    return `project:${p}`;
+  }
+  if (memory.scope === "global") return "global";
+  return memory.scope || "project";
+}
+
 function formatMemory(memory) {
   const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
   const pin = memory.pinned ? " pinned" : "";
-  const project = memory.scope === "project" ? ` project=${compactProject(memory.project)}` : "";
-  return `- ${cleanInline(memory.id, 128)}${tags}${pin} (${memory.scope}${project}, ${memory.updatedAt})\n  ${memory.text}`;
+  const scope = scopeLabel(memory);
+  return `- ${shortId(memory.id)}${tags}${pin} (${scope}, ${memory.updatedAt})\n  ${memory.text}`;
 }
 
-// A redacted rendering, used for memories that belong to a project which still
-// exists. Listing them is a review aid, not a recovery step, so their text is
-// not dumped into the tool output in full: an id, the owning project and a
-// short excerpt are enough to tell them apart, and the full text stays behind
-// the id the caller already has to name to move one.
 function formatMemorySummary(memory) {
   const flat = String(memory.text || "").replace(/\s+/g, " ").trim();
   const excerpt = flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
   const tags = memory.tags?.length ? ` [${memory.tags.join(", ")}]` : "";
-  const project = compactProject(memory.project) || "(none)";
-  return `- ${cleanInline(memory.id, 128)}${tags} (project=${project}, ${memory.updatedAt})\n  ${excerpt}`;
+  const scope = scopeLabel(memory);
+  return `- ${shortId(memory.id)}${tags} (${scope}, ${memory.updatedAt})\n  ${excerpt}`;
 }
 
 // ---------------------------------------------------------------------------

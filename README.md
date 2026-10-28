@@ -48,7 +48,7 @@ Linux/macOS: run:
 sh ./install.sh
 ```
 
-This installs the plugin dependency, registers the plugin with OpenCode, **and copies the `/listen` and `/imgread` slash commands** into your OpenCode config directory. Then restart OpenCode.
+This installs the plugin dependency, registers the plugin with OpenCode, **and copies the `/listen`, `/imgread`, `/remember`, `/recall`, `/forget`, and `/stats` slash commands** into your OpenCode config directory. Then restart OpenCode.
 
 To install only the slash commands into the current project instead of your global config:
 

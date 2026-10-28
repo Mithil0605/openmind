@@ -70,8 +70,9 @@ console.log("Registering plugin with OpenCode...");
 const register = run("opencode", ["plugin", root, "--global", "--force"]);
 if (register.status !== 0) fail("OpenCode plugin registration failed. Check the messages above, then run setup again.");
 
-// Slash commands (/listen, /imgread) ship with the package. Without this step the
-// README advertised commands that no install ever delivered.
+// Slash commands (/listen, /imgread, /remember, /recall, /forget, /stats) ship with
+// the package. Without this step the README advertised commands that no install
+// ever delivered.
 // OpenCode scans both `command/` and `commands/` under a config directory.
 function configDir() {
   if (process.env.OPENCODE_CONFIG_DIR) return resolve(process.env.OPENCODE_CONFIG_DIR);
@@ -110,5 +111,9 @@ console.log("  Remember for this project that I prefer short answers.");
 console.log("  What do you remember about this project?");
 console.log("  /listen https://example.com");
 console.log("  /imgread screenshot.png");
+console.log("  /remember I prefer short answers");
+console.log("  /recall authentication");
+console.log("  /stats");
+console.log("  /forget <id>");
 console.log("\nOpenMind v5 does not save session data. Durable memory is opt-in, project-scoped, and can be deleted at any time.");
 console.log("Memory file location can be changed later with OPENCODE_MEMORY_DIR.");

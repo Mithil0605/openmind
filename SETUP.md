@@ -32,7 +32,7 @@ Then restart OpenCode.
 
 - installs the plugin's own dependency,
 - registers the plugin with OpenCode globally,
-- copies the `/listen` and `/imgread` slash commands into your OpenCode config directory (`commands/`).
+- copies the `/listen`, `/imgread`, `/remember`, `/recall`, `/forget`, and `/stats` slash commands into your OpenCode config directory (`commands/`).
 
 Setup needs OpenCode and Node.js 22 or newer. It never uploads anything.
 
@@ -50,6 +50,10 @@ Then try the slash commands:
 ```text
 /listen https://example.com
 /imgread path/to/screenshot.png
+/remember I prefer short answers
+/recall authentication
+/stats
+/forget <id>
 ```
 
 ## Optional Extras
