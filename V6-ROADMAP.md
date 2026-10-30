@@ -7,7 +7,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
-## Status (as of 6.2.0)
+## Status (as of 6.3.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -80,10 +80,9 @@ versions into every user install; `npm audit --omit=dev` is now clean, and
 `npm install --omit=dev` installs nothing at all.
 
 **Open follow-ups (not in 6.0.0):**
-1. **Stable project identity (#7).** Scope is still a raw absolute path. Routing
-   the key through `ctx.location.project.id` / `session.projectID` fixes the
-   *isolation* question but not the *renaming* one: moving a checkout still
-   orphans its memories. This is the highest-value remaining correctness item.
+1. **Stable project identity (#7) — shipped in 6.3.0.** The project key is now a
+   stable identity (`op:<opencode-project-id>` or `pid:<sha256-of-canonicalized-path>`)
+   with rename/move aliases tracked per store, instead of a raw absolute path.
 2. **Export size cap.** `memory_export` is still unbounded in output size; with a
    large store it can exhaust the model's context. Import is capped, export is
    not. Same class of issue as #8.
@@ -105,8 +104,15 @@ versions into every user install; `npm audit --omit=dev` is now clean, and
 transparency) and #12 (search index).** This release is about making the store
 inspectable and recall cheaper without changing a single ranking result.
 
+**Shipped in 6.3.0 — #7 (stable project identity) plus the accessibility sweep.**
+The highest-value remaining correctness item closed: the project key is no
+longer a raw absolute path that goes stale on rename/move.
+
 | Feature | Where | Why it matters |
 |---|---|---|
+| Stable project identity | `resolveProjectKey`, `stablePathIdentity`, `IDENTITY_FILE` | The key is `op:<opencode-project-id>` when the instance knows it, else `pid:<sha256(realpath)[:24]>`, with aliases tracked per store. Renames/moves keep memories because the identity is path-derived and aliased; legacy raw-path stores are read through the alias map on next write. |
+| Short ids + scope labels | `shortId`, `scopeLabel` | Lists/recall/results show short ids and scope labels; mutators accept full or short ids. |
+| Slash commands + help tools | `commands/`, `memory_help`, `memory_inspect` | `/remember`, `/recall`, `/forget`, `/stats` plus agent-facing cheat sheet and single-memory inspection. |
 | Versioned store | `index.js` (`STORE_VERSION`, `packStoreBody`, `STORE_MIGRATIONS`) | The JSONL format is now self-describing: a plaintext marker line, or an `entries` envelope inside the ciphertext. A reader can tell "current", "older but upgradeable" and "written by a newer plugin" apart *before* it parses entries. |
 | Migration ladder | `pendingStoreMigrations`, `upgradeVault` | v5 plaintext, v5 encrypted and legacy-v2-KDF files all upgrade on load/next write, and `memory_stats` reports what is pending. Each step is one named function, so the next format bump does not become a rewrite. |
 | Future-version refusal | `storeRefusal` at every guard site | A store that declares a version this build does not know is left **byte-identical** — no read, no write, no migration. The alternative (best-effort parsing) silently drops fields and then saves the truncated result. |
@@ -364,5 +370,5 @@ each historical fixture and asserts the v6 result.
 | **v6.0 (correctness)** — shipped | P0 #1–#5 + regression tests #20 | The store works; the *feature* does not. Ship the injection fix first — it is the difference between "OpenMind remembers" and "OpenMind saves". |
 | **v6.1 (visibility + restore)** — shipped | #6 `memory_import`, #17 `memory_stats`, tag inventory, time windows, `imported` trust tag | Restores what export could only back up, and answers "what is actually in memory?" without reading the JSONL. |
 | **v6.2 (index)** — shipped | P2 #12 (inverted index, not FTS5 — see above) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index, and makes the store self-describing. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
-| **v6.3 (scope + lifecycle)** | #7 stable project identity, #5 global scope done properly, #8 caps/TTL + export cap, #9 agent scope | Fixes the family of "which project does this belong to" problems at the root instead of patching the symptom. |
+| **v6.3 (scope + lifecycle)** — shipped | #7 stable project identity, plus the v6.2 accessibility wins (short ids, scope labels, `/remember` `/recall` `/forget` `/stats`, `memory_help`, `memory_inspect`) and `memory_reassign` short-id resolution | #7 routes the project key through a stable identity (`op:<id>` or `pid:<hash>`) with rename/moves aliased instead of a raw absolute path that goes stale. #5 (global scope done properly), #8 (caps/TTL + export cap) and #9 (agent scope) remain open. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

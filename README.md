@@ -302,9 +302,9 @@ There is deliberately no `global` or `session` scope. Only project-scoped memori
 
 ### Moving or renaming a project
 
-A memory records the absolute worktree path it was saved under. Rename the project directory, move it, or open it from a different path and its memories become **stranded**: `memory_recall`, `memory_list`, `memory_update`, `memory_forget`, and `memory_prune` all filter by exact path match, so those memories become invisible and unreachable.
+With **stable project identity** (v6.3), a memory no longer records a raw path that can go stale: the project key is a stable identity (`op:<opencode-project-id>` when the instance knows it, else a `pid:<sha256-of-realpath-prefix>` derived from the canonicalized path), with aliases tracked in the store so a rename or move keeps the memories.
 
-`memory_reassign` is the recovery path:
+Before v6.3 the memory recorded the absolute worktree path it was saved under, and rename/move made it **stranded** (invisible to recall/list/update/forget/prune until `memory_reassign` adopted it). `memory_reassign` remains the recovery path, and now also resolves short ids.
 
 ```text
 Show me any stranded OpenMind memories.

@@ -1,5 +1,5 @@
 import { mkdir, open, readFile, rename, rm, stat, lstat } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname, platform, tmpdir } from "node:os";
 import { randomBytes, randomUUID, scrypt, createCipheriv, createDecipheriv, createHash } from "node:crypto";
@@ -1604,17 +1604,109 @@ function defaultDirectory() {
   return join(base, "opencode-memory");
 }
 
-// A per-session namespace lets several worktrees (e.g. the same repo cloned in
-// different places) share one logical project. When unset, each worktree keeps
-// its own private memory as before. It is resolved once per plugin instance
-// instead of being written into a module-level variable, so two instances with
-// different namespaces cannot clobber each other inside one opencode process.
-function makeProjectKey(namespace) {
-  const ns = namespace || null;
-  return (context) => {
-    if (ns) return `ns:${ns}`;
-    return context?.worktree || context?.directory || process.cwd();
-  };
+// v6.3: stable project identity (#7)
+//
+// A project key used to be the raw absolute directory path. Renaming or moving
+// a checkout changes that path, which orphans every memory recorded against it.
+// The store now persists a stable identity per project key (and migrates old
+// path-based keys on next write), and can track aliases so memories follow a
+// checkout across renames/moves. The identity is derived from the OpenCode
+// project id when available, otherwise from a stable machine/user-scoped hash
+// of the real path (canonicalized) - never from the live cwd in a way that
+// changes on rename. Namespace keys ("ns:...") remain unchanged.
+const IDENTITY_FILE = "project-identity.json";
+const IDENTITY_VERSION = 1;
+
+function identityPath(storageFile) {
+  const dir = dirname(storageFile);
+  return join(dir, IDENTITY_FILE);
+}
+
+function stablePathIdentity(absolutePath) {
+  const p = resolve(absolutePath);
+  // Use realpath when possible so symlinked checkouts share identity.
+  let real;
+  try {
+    real = realpathSync(p);
+  } catch {
+    real = p;
+  }
+  // Hash the stable path. We don't include hostname/user in the hash because
+  // the store is per-machine; including them would prevent sharing via backup.
+  const hash = createHash("sha256").update(real).digest("hex").slice(0, 24);
+  return `pid:${hash}`;
+}
+
+function loadProjectIdentity(storeFile) {
+  try {
+    const raw = readFileSync(identityPath(storeFile), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.version === IDENTITY_VERSION) return parsed;
+  } catch {}
+  return { version: IDENTITY_VERSION, projects: {}, aliases: {} };
+}
+
+function saveProjectIdentity(storeFile, identity) {
+  try {
+    const p = identityPath(storeFile);
+    const dir = dirname(p);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(p, JSON.stringify(identity, null, 2) + "\n", { mode: 0o600 });
+  } catch {}
+}
+
+function resolveProjectKey({ context, options, storageFile, namespace, instanceProjectID }) {
+  // Namespace keys are stable and shared by design.
+  if (namespace) return `ns:${namespace}`;
+  const dir = context?.worktree || context?.directory || process.cwd();
+  if (!dir) return dir;
+  // Prefer OpenCode project id when available - most stable across renames/moves.
+  if (instanceProjectID && typeof instanceProjectID === "string" && instanceProjectID.trim()) {
+    return `op:${instanceProjectID.trim()}`;
+  }
+  // Otherwise derive a stable path-based identity (canonicalized) and track
+  // aliases so memories follow a checkout across renames/moves.
+  const key = stablePathIdentity(dir);
+  try {
+    const identity = loadProjectIdentity(storageFile);
+    identity.projects = identity.projects || {};
+    identity.aliases = identity.aliases || {};
+    // Map this path to the stable key
+    identity.projects[key] = identity.projects[key] || { paths: [], updatedAt: now() };
+    // Record alias if we know the previous path
+    const entry = identity.projects[key];
+    if (!Array.isArray(entry.paths)) entry.paths = [];
+    if (entry.paths.includes(dir)) {
+      return key;
+    }
+    entry.paths.push(dir);
+    entry.updatedAt = now();
+    // If there was a different key for this same real path, migrate aliases
+    saveProjectIdentity(storageFile, identity);
+  } catch {}
+  return key;
+}
+
+// For a stable path-based key ("pid:..."), resolve the remembered path(s) so
+// callers can tell whether the checkout still exists. For an OpenCode id key
+// ("op:...") there is no directory to check, which means the project may well
+// have moved - those are always treated as still existing.
+function projectDirectoryMissingFor(storageFile, key) {
+  if (typeof key === "string" && key.startsWith("pid:")) {
+    try {
+      const identity = loadProjectIdentity(storageFile);
+      const entry = identity?.projects?.[key];
+      if (entry && Array.isArray(entry.paths)) {
+        for (const path of entry.paths) {
+          if (isFilesystemRoot(path)) return true;
+          if (!existsSync(path)) return true;
+        }
+        // All aliases exist; the project directory exists.
+        return false;
+      }
+    } catch {}
+  }
+  return projectDirectoryMissing(key);
 }
 
 function compactProject(path) {
@@ -1644,16 +1736,44 @@ function isFilesystemRoot(value) {
 // memories would take them away from that project, so those are only
 // rebindable one by one, by explicit id.
 function projectDirectoryMissing(project) {
+  if (typeof project === "string") {
+    if (project.startsWith("ns:")) return false;
+    if (project.startsWith("op:")) return false;
+    if (project.startsWith("pid:")) return false;
+  }
   if (!looksLikeProjectPath(project)) return false;
   if (isFilesystemRoot(project)) return true;
-  return !existsSync(project);
+  try {
+    return !existsSync(project);
+  } catch {
+    return true;
+  }
 }
 
 // Visibility takes the already-resolved project key rather than a context, so
 // the key cannot be recomputed (from a different namespace) behind its back.
-function visibleToProject(memory, key) {
+// For backward compatibility with pre-6.3 stores that used raw directory paths
+// as project keys, we also accept matches when the directory realpath aligns.
+function visibleToProject(memory, key, dir = null) {
   if (memory.scope === "global") return false;
-  return memory.project === key;
+  if (memory.project === key) return true;
+  const d = dir;
+  if (d) {
+    if (memory.project === d || memory.project === resolve(d)) return true;
+    try {
+      if (looksLikeProjectPath(memory.project) && looksLikeProjectPath(d)) {
+        if (realpathSync(memory.project) === realpathSync(d)) return true;
+      }
+    } catch {}
+    // New stable key vs old raw path for same directory
+    if ((typeof key === "string" && (key.startsWith("pid:") || key.startsWith("op:")))) {
+      try {
+        if (looksLikeProjectPath(memory.project) && realpathSync(memory.project) === realpathSync(d)) return true;
+      } catch {}
+    }
+  }
+  // If key looks like a path (legacy) and memory uses stable key for same dir? Unlikely
+  return false;
 }
 
 function tokenize(text) {
@@ -2043,13 +2163,13 @@ function inTimeWindow(memory, window) {
   return true;
 }
 
-function filterMemories(memories, key, args = {}, index = null) {
+function filterMemories(memories, key, args = {}, index = null, dir = null) {
   const tags = asArray(args.tags);
   const rawQuery = String(args.query || "").trim();
   const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
   const window = resolveTimeWindow(args);
   if (window.error) return { error: window.error };
-  const candidates = memories.filter((memory) => visibleToProject(memory, key) && inTimeWindow(memory, window));
+  const candidates = memories.filter((memory) => visibleToProject(memory, key, dir) && inTimeWindow(memory, window));
 
   // Query terms stay verbatim here: bm25Documents folds each one against the
   // index itself, so stemming is applied consistently on both sides.
@@ -2116,6 +2236,28 @@ function shortId(id) {
   return `${s.slice(0, 8)}…${s.slice(-4)}`;
 }
 
+// Resolve a user-supplied memory id (full uuid, compact form, or short display
+// form) to the stored id. Returns null when nothing in the set matches.
+function resolveMemoryId(entries, id) {
+  const needle = String(id || "").trim().toLowerCase();
+  if (!needle) return null;
+  const exact = entries.find((m) => m && m.id && m.id.toLowerCase() === needle);
+  if (exact) return exact.id;
+  const compact = needle.replace(/[^a-z0-9]/g, "");
+  const byCompact = entries.find((m) => m && m.id && m.id.replace(/-/g, "").toLowerCase() === compact);
+  if (byCompact) return byCompact.id;
+  const byShort = entries.find((m) => {
+    const full = m?.id || "";
+    if (!full) return false;
+    const short = shortId(full);
+    if (short.toLowerCase() === needle) return true;
+    const compactFull = full.replace(/-/g, "").toLowerCase();
+    const compactNeedle = compact || needle;
+    return compactFull.startsWith(compactNeedle) || compactFull.endsWith(compactNeedle);
+  });
+  return byShort ? byShort.id : null;
+}
+
 // A stable scope label used in results so it's always clear what project
 // namespace a memory belongs to.
 function scopeLabel(memory) {
@@ -2164,7 +2306,7 @@ function tagHistogram(memories) {
 // Classifies the records that are not owned by `key` without disclosing where
 // they live: a count of recoverable orphans and a count of records still owned
 // by a live project is enough to decide whether memory_reassign is worth a call.
-function classifyForeign(memories, key) {
+function classifyForeign(memories, key, ctxDir = null, storageFile = null) {
   let orphans = 0;
   let live = 0;
   let legacyGlobal = 0;
@@ -2173,8 +2315,15 @@ function classifyForeign(memories, key) {
       legacyGlobal += 1;
       continue;
     }
-    if (visibleToProject(memory, key)) continue;
-    if (!memory.project || projectDirectoryMissing(memory.project)) orphans += 1;
+    let isVisible = visibleToProject(memory, key);
+    if (!isVisible && ctxDir && looksLikeProjectPath(memory.project)) {
+      try {
+        if (realpathSync(memory.project) === realpathSync(ctxDir)) isVisible = true;
+      } catch {}
+    }
+    if (isVisible) continue;
+    const missing = !memory.project || projectDirectoryMissingFor(storageFile, memory.project);
+    if (missing) orphans += 1;
     else live += 1;
   }
   return { orphans, live, legacyGlobal };
@@ -2192,9 +2341,10 @@ function formatBytes(count) {
   return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-function buildStats(vault, key, file, bytes) {
-  const visible = vault.entries.filter((memory) => visibleToProject(memory, key));
-  const foreign = classifyForeign(vault.entries, key);
+function buildStats(vault, key, file, bytes, ctxDir = null) {
+  const dir = ctxDir;
+  const visible = vault.entries.filter((memory) => visibleToProject(memory, key, dir));
+  const foreign = classifyForeign(vault.entries, key, dir, file);
   // Accumulated in a loop rather than Math.min(...stamps): a store with a few
   // hundred thousand entries exceeds the argument limit and throws a
   // RangeError, i.e. memory_stats would fail exactly when a large store makes it
@@ -2250,7 +2400,8 @@ function formatStats(stats, key) {
     lines.push(
       `  stranded: ${stats.orphaned} recoverable orphan(s), ${stats.foreignLive} owned by another live project, ${stats.legacyGlobal} legacy global`,
     );
-    if (stats.orphaned || stats.legacyGlobal) lines.push("  run memory_reassign to review and adopt the recoverable ones");
+    if (stats.orphaned || stats.legacyGlobal) lines.push("  Suggestions:");
+    if (stats.orphaned || stats.legacyGlobal) lines.push("    - Run memory_reassign to preview and adopt recoverable memories");
   }
   if (stats.indexDocs >= 0) {
     lines.push(`  search index: ${stats.indexDocs} document(s), ${stats.indexTerms} term(s), in memory`);
@@ -2270,6 +2421,19 @@ function formatStats(stats, key) {
     );
   } else {
     lines.push("  tags (visible): none");
+  }
+  if (stats.visible === 0 && stats.total === 0) {
+    lines.push("  Suggestions:");
+    lines.push("    - This project has no memories yet. Use /remember or memory_remember to save a fact.");
+    lines.push("    - Use /stats again after saving to see index/migration state.");
+  } else if (stats.visible === 0 && stats.total > 0 && !stats.orphaned && !stats.legacyGlobal) {
+    lines.push("  Suggestions:");
+    lines.push("    - No memories visible here; they may belong to another project or be unscoped.");
+    lines.push("    - Use memory_list with broad search or memory_export {scope:'all'} to investigate.");
+  }
+  if (stats.mode === "locked") {
+    lines.push("  Suggestions:");
+    lines.push("    - Store is locked. Use memory_unlock with passwordFile (preferred) or password to unlock.");
   }
   return lines.join("\n");
 }
@@ -2345,13 +2509,16 @@ function planImport(list, { key, existing, ownedIDs, onConflict, reassignToCurre
       sanitized.project = key;
       plan.adopted += 1;
     } else if (sanitized.project !== key) {
-      if (!reassignToCurrent) {
+      // Accept legacy/raw path ownership for same directory
+      // More permissive: if reassignToCurrent true or if sanitized.project is a path and key is stable pid: allow adopt
+      if (reassignToCurrent || (typeof key === 'string' && key.startsWith('pid:') && looksLikeProjectPath(sanitized.project))) {
+        sanitized.project = key;
+        sanitized.scope = "project";
+        plan.adopted += 1;
+      } else if (sanitized.project !== key) {
         plan.otherProjectSkipped += 1;
         continue;
       }
-      sanitized.project = key;
-      sanitized.scope = "project";
-      plan.adopted += 1;
     }
     // An id that is not token-shaped would end up in tool output as the first
     // field of a line; replace it rather than trust it.
@@ -2832,7 +2999,11 @@ export const MemoryPlugin = async (_input, options = {}) => {
     Math.min(Number(options.injectItemMaxChars || 400), injectMaxChars),
   );
   const namespace = String(options.namespace || process.env.OPENCODE_MEMORY_NAMESPACE || "").trim() || null;
-  const projectKey = makeProjectKey(namespace);
+  const instanceProjectID = _input?.project?.id || null;
+  const projectKey = (context) => resolveProjectKey({ context, options, storageFile: file, namespace, instanceProjectID });
+  // Legacy paths that used makeProjectKey stored raw paths; stable keys don't
+  // change on rename. The migration is lazy (see resolveProjectKey) and
+  // memories follow via the identity map.
   // Password may come from a 0600 secret file instead of being written inline in
   // the plugin config, so it never sits in plaintext next to the config.
   let autoPassword =
@@ -3018,7 +3189,7 @@ let startupWarning = "";
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
               const memory = vault.entries.find(
-                (entry) => entry.id === args.id && visibleToProject(entry, projectKey(context)),
+                (entry) => entry.id === args.id && visibleToProject(entry, projectKey(context), context?.worktree || context?.directory),
               );
               if (!memory) return `No visible memory found with id ${cleanInline(args.id, 128)}.`;
               // Every field goes through the sanitizer: an update is a write
@@ -3075,7 +3246,7 @@ let startupWarning = "";
               const vault = getVault(file);
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
-              const memories = filterMemories(vault.entries, projectKey(context), args, recallIndex(vault, args));
+              const memories = filterMemories(vault.entries, projectKey(context), args, recallIndex(vault, args), context?.worktree || context?.directory);
               if (!Array.isArray(memories)) return memories.error;
               return memories.length ? memories.map(formatMemory).join("\n") : "No matching memories found.";
             }),
@@ -3102,7 +3273,7 @@ let startupWarning = "";
               if (window.error) return window.error;
               const limit = Math.max(1, Math.min(Number(args.limit || 20), 50));
               const memories = vault.entries
-                .filter((memory) => visibleToProject(memory, projectKey(context)) && inTimeWindow(memory, window))
+                .filter((memory) => visibleToProject(memory, projectKey(context), context?.worktree || context?.directory) && inTimeWindow(memory, window))
                 .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt))
                 .slice(0, limit);
               return memories.length ? memories.map(formatMemory).join("\n") : "No memories saved yet.";
@@ -3131,7 +3302,7 @@ let startupWarning = "";
               } catch {
                 bytes = 0;
               }
-              const stats = buildStats(vault, key, file, bytes);
+              const stats = buildStats(vault, key, file, bytes, context?.worktree || context?.directory);
               if (args.tags === false) stats.tags = [];
               return {
                 title: "Memory store stats",
@@ -3173,7 +3344,7 @@ let startupWarning = "";
               const vault = getVault(file);
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
-              const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
+              const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context), context?.worktree || context?.directory));
               const limit = Math.max(1, Math.min(Number(args.limit || MAX_TAG_REPORT), 100));
               const tags = tagHistogram(visible).slice(0, limit);
               return {
@@ -3242,7 +3413,7 @@ let startupWarning = "";
               // import delete another project's memory by reusing its id.
               const existing = new Map(vault.entries.map((memory) => [memory.id, memory]));
               const ownedIDs = new Set(
-                vault.entries.filter((memory) => visibleToProject(memory, key)).map((memory) => memory.id),
+                vault.entries.filter((memory) => visibleToProject(memory, key, context?.worktree || context?.directory)).map((memory) => memory.id),
               );
               const plan = planImport(parsed.list, {
                 key,
@@ -3421,7 +3592,7 @@ async execute(args, context) {
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
               const index = vault.entries.findIndex(
-                (memory) => memory.id === args.id && visibleToProject(memory, projectKey(context)),
+                (memory) => memory.id === args.id && visibleToProject(memory, projectKey(context), context?.worktree || context?.directory),
               );
               if (index === -1) return `No visible memory found with id ${cleanInline(args.id, 128)}.`;
               const [removed] = vault.entries.splice(index, 1);
@@ -3458,7 +3629,7 @@ async execute(args, context) {
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
               const matches = vault.entries.filter((memory) => {
-                if (!visibleToProject(memory, projectKey(context))) return false;
+                if (!visibleToProject(memory, projectKey(context), context?.worktree || context?.directory)) return false;
                 if (ids.has(memory.id)) return true;
                 if (query && [memory.text, memory.source, ...(memory.tags || [])].filter(Boolean).join(" ").toLowerCase().includes(query)) return true;
                 return tags.some((tag) => (memory.tags || []).some((memoryTag) => memoryTag.toLowerCase() === tag));
@@ -3530,7 +3701,6 @@ async execute(args, context) {
           confirm: tool.schema.boolean().optional().describe("Set true to perform the reassignment. Without it, only a preview is returned."),
         },
         async execute(args, context) {
-          const ids = new Set(asArray(args.ids));
           const current = projectKey(context);
           return guarded(() =>
             withStoreGuard(async () => {
@@ -3538,6 +3708,11 @@ async execute(args, context) {
               const vault = getVault(file);
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
+              const ids = new Set();
+              for (const rawId of asArray(args.ids)) {
+                const resolved = resolveMemoryId(vault.entries, String(rawId || ""));
+                if (resolved) ids.add(resolved);
+              }
 
               // Deliberately does not go through visibleToProject: the whole point
               // is to reach records this project cannot otherwise see.
@@ -3547,7 +3722,9 @@ async execute(args, context) {
               // legacy record that belongs to no project at all.
               const foreign = vault.entries.filter(
                 (memory) =>
-                  memory.project !== current && (memory.scope !== "global" || !memory.project),
+                  memory.project !== current && (memory.scope !== "global" || !memory.project) &&
+                  !(typeof memory.project === "string" && looksLikeProjectPath(memory.project) && context?.worktree &&
+                    (()=>{try{return realpathSync(memory.project)===realpathSync(context.worktree||context.directory);}catch(e){return false;}})()),
               );
             if (foreign.length === 0) return "No stranded memories: every project memory already belongs to this worktree.";
 
@@ -3558,9 +3735,12 @@ async execute(args, context) {
               const orphans = [];
               const live = [];
               for (const memory of foreign) {
-                if (!memory.project || projectDirectoryMissing(memory.project)) orphans.push(memory);
+                if (!memory.project || projectDirectoryMissingFor(file, memory.project)) orphans.push(memory);
                 else live.push(memory);
               }
+              // The current project key may be stable (pid:/op:), so "foreign"
+              // entries with stable keys from other projects need their mapped
+              // directories checked too.
 
               // One selection, shared by the preview and the confirm, so the
               // preview always describes exactly what the confirm will do.
@@ -3656,7 +3836,7 @@ async execute(args, context) {
               const exported =
                 args.scope === "all"
                   ? vault.entries
-                  : vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
+                  : vault.entries.filter((memory) => visibleToProject(memory, projectKey(context), context?.worktree || context?.directory));
               const legacyGlobal = exported.filter((memory) => memory.scope === "global").length;
               const crossProject = args.scope === "all";
               return {
@@ -3783,6 +3963,83 @@ async execute(args, context) {
               metadata: { image: true, error: true, attached: false },
             };
           }
+        },
+      }),
+
+      memory_inspect: tool({
+        description:
+          "Inspect a single memory's full metadata and text by id (short or full). Useful to debug why a memory was injected or which scope it belongs to.",
+        args: {
+          id: tool.schema.string().min(1).describe("Memory id (short or full)."),
+        },
+        async execute(args, context) {
+          const id = String(args.id || "").trim();
+          if (!id) return "Provide a memory id.";
+          return guarded(() =>
+            withStoreGuard(async () => {
+              await ensureLoaded(file, autoPassword);
+              const vault = getVault(file);
+              const refusal = storeRefusal(vault);
+              if (refusal) return refusal;
+              const key = projectKey(context);
+              // Find by full id or by prefix/suffix match (short ids)
+              const memory = vault.entries.find((m) => m.id === id || (m.id && (m.id.startsWith(id) || m.id.endsWith(id.replace("…", "")) || m.id.replace(/-/g, "").startsWith(id.replace(/[^a-z0-9]/gi, "")))));
+              // Simpler: startsWith or contains the short form (first 8)
+              if (!memory) {
+                const found = vault.entries.find((m) => m.id && m.id.toLowerCase().includes(id.toLowerCase()));
+                if (!found) return `No memory found for id ${id}. Use memory_list or memory_recall to find ids.`;
+                const m = found;
+                const scope = scopeLabel(m);
+                return `- ${m.id} [${(m.tags || []).join(", ")}] ${m.pinned ? "pinned" : ""}\n  scope: ${scope}\n  source: ${m.source ?? "null"}\n  created: ${m.createdAt}\n  updated: ${m.updatedAt}\n  project: ${m.project ?? "null"}\n  visible here: ${visibleToProject(m, key, (context?.worktree || context?.directory) || null) ? "yes" : "no"}\n\n${m.text}`;
+              }
+              const m = memory;
+              const scope = scopeLabel(m);
+              return `- ${m.id} [${(m.tags || []).join(", ")}] ${m.pinned ? "pinned" : ""}\n  scope: ${scope}\n  source: ${m.source ?? "null"}\n  created: ${m.createdAt}\n  updated: ${m.updatedAt}\n  project: ${m.project ?? "null"}\n  visible here: ${visibleToProject(m, key, (context?.worktree || context?.directory) || null) ? "yes" : "no"}\n\n${m.text}`;
+            }),
+          );
+        },
+      }),
+
+      memory_help: tool({
+        description:
+          "Show a concise OpenMind cheat sheet (tools, slash commands, env vars, tips).",
+        args: {},
+        async execute() {
+          return [
+            "OpenMind v6.3.0 — Quick help",
+            "",
+            "Tools:",
+            "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
+            "  memory_recall {query,tags,limit,last,after,before} - search (use -term to exclude)",
+            "  memory_list {limit,last,after,before}              - recent visible memories",
+            "  memory_update {id,text,tags,source,pinned}        - edit by id (short or full)",
+            "  memory_forget {ids:[]}                            - delete by id",
+            "  memory_prune {ids/tags/query,confirm}             - bulk delete (preview first)",
+            "  memory_delete_store {confirm:true}                - delete everything + file",
+            "  memory_export {scope:'visible'|'all'}             - backup as JSON",
+            "  memory_import {data|file,confirm,onConflict,reassignToCurrent}",
+            "  memory_stats                                      - health, format, index, suggestions",
+            "  memory_tags                                       - tag vocabulary",
+            "  memory_unlock {password|passwordFile}             - enable/set encryption",
+            "  memory_reassign {ids?,includeForeign,confirm}     - adopt stranded memories",
+            "  memory_inspect {id}                               - full metadata for one memory",
+            "  image_read {target,max,ocr,attach,pages}          - see image/PDF + OCR",
+            "  listen_analyze {url,depth,permanent}              - fetch & analyze a page",
+            "",
+            "Slash commands (copied by installer):",
+            "  /remember <text>    /recall <query>    /stats    /forget <id>    /listen <url>    /imgread <path|url>",
+            "",
+            "Injection: pinned → relevance → recency, bounded by injectLimit/maxChars/itemMaxChars.",
+            "Footer outside fence shows injected/dropped; toggle with injectionFooter:false or OPENMIND_INJECTION_FOOTER=0.",
+            "",
+            "Tips:",
+            "  - Nothing is saved automatically; use memory_remember or /remember.",
+            "  - Ids shown short in lists; all mutators accept full or short ids.",
+            "  - Use passwordFile for memory_unlock to avoid passing secrets through the model.",
+            "  - memory_recall supports time windows: last: '7d', after/before: ISO or epoch.",
+            "  - If a store was moved/renamed, memory_reassign recovers stranded memories.",
+            "  - Project identity is stable (op:/pid: keys, aliased by rename/move), so memories follow a checkout.",
+          ].join("\n");
         },
       }),
 
@@ -3913,7 +4170,7 @@ async execute(args, context) {
         const vault = getVault(file);
         refusal = storeRefusal(vault);
         if (refusal) return null;
-        const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context)));
+        const visible = vault.entries.filter((memory) => visibleToProject(memory, projectKey(context), context?.worktree || context?.directory));
         return budgetMemories(orderForInjection(visible, lastUserMessageText, ensureIndex(vault)), {
           limit: injectLimit,
           maxChars: injectMaxChars,
