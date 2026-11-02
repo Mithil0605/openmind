@@ -7,7 +7,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
-## Status (as of 6.3.0)
+## Status (as of 6.3.1)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -118,6 +118,14 @@ longer a raw absolute path that goes stale on rename/move.
 | Future-version refusal | `storeRefusal` at every guard site | A store that declares a version this build does not know is left **byte-identical** — no read, no write, no migration. The alternative (best-effort parsing) silently drops fields and then saves the truncated result. |
 | Injection footer | `memoryFooter`, `injectionFooter` option | One line, outside the memory fence: `[OpenMind: injected 2 of 5 saved memories for ~/project, 3 not shown (budget).]` It distinguishes "nothing saved", "everything dropped" and "injected" instead of showing silence for all three. Emitted only when something was considered, and only when `considered > 0`. |
 | Search index | `buildMemoryIndex`, `bm25WithIndex`, `ensureIndex` | Token bags and a term → entries postings map, built once per store version and dropped by `saveVault` (and by the plaintext append shortcut). Prefix expansion becomes a binary search; scoring touches only documents that contain a query expansion. `memory_stats` reports `indexDocs` / `indexTerms`. |
+
+**Shipped in 6.3.1 — agent usability sweep.** Short ids are now honored by every
+mutating tool (`memory_update`, `memory_forget`, `memory_prune` resolve through the
+shared `resolveMemoryId` before touching the vault), and a new `memory_upload` tool
+turns a readable file (image/PDF via OCR, or any text file) into a saved project memory,
+framed as untrusted data like web-derived text.
+
+---
 
 ### #12 was implemented without SQLite, deliberately
 
@@ -371,4 +379,5 @@ each historical fixture and asserts the v6 result.
 | **v6.1 (visibility + restore)** — shipped | #6 `memory_import`, #17 `memory_stats`, tag inventory, time windows, `imported` trust tag | Restores what export could only back up, and answers "what is actually in memory?" without reading the JSONL. |
 | **v6.2 (index)** — shipped | P2 #12 (inverted index, not FTS5 — see above) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index, and makes the store self-describing. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
 | **v6.3 (scope + lifecycle)** — shipped | #7 stable project identity, plus the v6.2 accessibility wins (short ids, scope labels, `/remember` `/recall` `/forget` `/stats`, `memory_help`, `memory_inspect`) and `memory_reassign` short-id resolution | #7 routes the project key through a stable identity (`op:<id>` or `pid:<hash>`) with rename/moves aliased instead of a raw absolute path that goes stale. #5 (global scope done properly), #8 (caps/TTL + export cap) and #9 (agent scope) remain open. |
+| **v6.3.1 (agent usability)** — shipped | short ids for `memory_update` / `memory_forget` / `memory_prune`, plus new `memory_upload` | Closing the last gap between "the agent can save" and "the agent can use" what it saved: every mutator accepts a short id, and an uploaded file becomes a first-class memory. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

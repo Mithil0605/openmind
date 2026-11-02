@@ -76,7 +76,7 @@ config shows a **path** entry rather than a package name.
 
 ## 4. Tool surface
 
-15 tools, all defined once inside `MemoryPlugin`:
+16 tools, all defined once inside `MemoryPlugin`:
 
 | Tool | Purpose |
 | --- | --- |
@@ -95,6 +95,7 @@ config shows a **path** entry rather than a package name.
 | `memory_import` | restore an export: dry-run, re-sanitized, project-scoped |
 | `image_read` | attach an image/PDF plus OCR text |
 | `listen_analyze` | fetch and analyze one public page |
+| `memory_upload` | upload a file into memory: image/PDF via OCR, or text via read |
 
 Every tool body runs through `guarded()`, which converts an escaping exception
 into a readable tool result instead of breaking the turn.

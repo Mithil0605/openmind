@@ -4,7 +4,7 @@ Privacy-first, user-controlled memory tools for **OpenCode V2** on Windows, Linu
 
 > The npm package name is still `openmind-v5` until the registry rename lands (see [V6-ROADMAP.md](./V6-ROADMAP.md)). Local-folder installs are unaffected.
 
-OpenMind installs as a single OpenCode plugin that registers 15 tools and a bounded memory-injection hook. It never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, the entire backing store, or restore a previous export.
+OpenMind installs as a single OpenCode plugin that registers 16 tools and a bounded memory-injection hook. It never saves sessions. Durable memory is opt-in and is limited to explicit project preferences. Users can permanently delete one item, matching unwanted items, the entire backing store, or restore a previous export.
 
 The store can be encrypted with AES-256-GCM. A password is verified like `sudo`, with a 5-attempt rate limit that locks access for 5 minutes after repeated failures.
 
@@ -138,6 +138,7 @@ Windows example:
 - `memory_export`: show/export stored memories. `scope: "visible"` (default) exports the current worktree's memories; `scope: "all"` exports every record in the store, including legacy global-scope entries that no project can see (they are reported separately as `legacyGlobal`).
 - `memory_import`: restore memories from a `memory_export` payload (`data` JSON text or `file`). Dry run by default — pass `confirm: true` to write. Every entry is re-sanitized and capped, `onConflict` chooses between `skip` (default), `overwrite` and `new-id`, and entries recorded against another project are refused unless you pass `reassignToCurrent: true`, and legacy global records are re-homed into the importing project (they belong to nobody, so leaving them global would make them invisible and bulk-adoptable by another project). Imported entries carry the `imported` tag and are framed as untrusted data at injection time.
 - `image_read`: read an image or PDF so the model can actually *see* it — attaches the real image to the conversation and reports format, dimensions, and OCR'd text. Accepts a local path or an http(s) URL. Only image files are read; everything else is refused without revealing contents. URLs are SSRF-guarded (private, loopback, link-local, and cloud-metadata hosts are blocked).
+- `memory_upload`: upload a file into project memory and save it as a project memory. Images and PDFs are read with OCR (like `image_read`); other files are read as text. The saved memory is framed as untrusted data at injection time.
 - `listen_analyze`: fetch and comprehensively analyze one public website: metadata, Open Graph data, headings, links, images, code, tables, lists, full text, and detected tech stack. SSRF-guarded, honors `robots.txt`, and runs under size, deadline, and content-type limits. Backed by the `/listen` slash command.
 
 ### How recall ranks
