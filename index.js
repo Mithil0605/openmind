@@ -3828,9 +3828,11 @@ async execute(args, context) {
       }),
 
       memory_export: tool({
-        description: "Show the memory store location and export stored memories as JSON.",
+        description: "Show the memory store location and export stored memories as JSON. Output is bounded (default 200 entries / 32000 chars, overridable with maxEntries/maxChars) so a large store cannot exhaust the model's context; truncated exports report truncated and total.",
         args: {
           scope: tool.schema.enum(["visible", "all"]).optional().describe("visible is default (current worktree only); all is a full-store view that crosses project boundaries - it includes every project's memories and the legacy global-scope entries that no project can see."),
+          maxEntries: tool.schema.number().int().min(1).max(1000).optional().describe("Maximum number of memories included in the export (default 200, hard cap 1000). The export is truncated when the store holds more."),
+          maxChars: tool.schema.number().int().min(1000).max(2000000).optional().describe("Maximum serialized character length of the export JSON (default 32000, hard cap 2000000)."),
         },
         async execute(args, context) {
           return guarded(() =>
@@ -3847,11 +3849,19 @@ async execute(args, context) {
                 args.scope === "all"
                   ? vault.entries
                   : vault.entries.filter((memory) => visibleToProject(memory, projectKey(context), context?.worktree || context?.directory));
-              const legacyGlobal = exported.filter((memory) => memory.scope === "global").length;
               const crossProject = args.scope === "all";
-              return {
-                title: "Memory export",
-                output: JSON.stringify(
+              // Export is bounded so a large store cannot exhaust the model's
+              // context: maxEntries (default 200, hard cap 1000) and maxChars
+              // (default 32000, hard cap 2000000) cap the serialized payload. The
+              // truncation is reported through `truncated` + `total` instead of
+              // being silent, so an agent can ask for a bigger window.
+              const capEntries = Number.isFinite(Number(args.maxEntries)) && Number(args.maxEntries) > 0 ? Math.min(Math.floor(Number(args.maxEntries)), 1000) : 200;
+              const capChars = Number.isFinite(Number(args.maxChars)) && Number(args.maxChars) > 0 ? Math.min(Math.floor(Number(args.maxChars)), 2000000) : 32000;
+              const legacyGlobalOf = (memories) => memories.filter((memory) => memory.scope === "global").length;
+              let selected = exported.slice(0, Math.max(1, capEntries));
+              let truncated = exported.length > selected.length;
+              const buildPayload = (memories) =>
+                JSON.stringify(
                   {
                     file,
                     encrypted: vault.encrypted,
@@ -3862,14 +3872,25 @@ async execute(args, context) {
                             "This export crosses project boundaries: it contains every project's memories, not just the current worktree's.",
                         }
                       : {}),
-                    count: exported.length,
-                    legacyGlobal,
-                    memories: exported,
+                    count: memories.length,
+                    ...(truncated ? { truncated: true, total: exported.length } : {}),
+                    legacyGlobal: legacyGlobalOf(memories),
+                    memories: memories,
                   },
                   null,
                   2,
-                ),
-                metadata: { file, count: exported.length, legacyGlobal },
+                );
+              let output = buildPayload(selected);
+              while (selected.length > 0 && output.length > capChars) {
+                selected = selected.slice(0, -1);
+                truncated = true;
+                output = buildPayload(selected);
+              }
+              if (output.length > capChars) output = output.slice(0, capChars);
+              return {
+                title: "Memory export",
+                output,
+                metadata: { file, count: selected.length, legacyGlobal: legacyGlobalOf(selected), truncated, total: exported.length },
               };
             }),
           );
@@ -4016,7 +4037,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.3.1 — Quick help",
+            "OpenMind v6.3.2 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4026,7 +4047,7 @@ async execute(args, context) {
             "  memory_forget {ids:[]}                            - delete by id",
             "  memory_prune {ids/tags/query,confirm}             - bulk delete (preview first)",
             "  memory_delete_store {confirm:true}                - delete everything + file",
-            "  memory_export {scope:'visible'|'all'}             - backup as JSON",
+            "  memory_export {scope,maxEntries,maxChars}       - backup as JSON (capped: 200 entries / 32k chars)",
             "  memory_import {data|file,confirm,onConflict,reassignToCurrent}",
             "  memory_stats                                      - health, format, index, suggestions",
             "  memory_tags                                       - tag vocabulary",

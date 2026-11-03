@@ -7,7 +7,8 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 ---
 
-## Status (as of 6.3.1)
+
+## Status (as of 6.3.2)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -83,9 +84,10 @@ versions into every user install; `npm audit --omit=dev` is now clean, and
 1. **Stable project identity (#7) — shipped in 6.3.0.** The project key is now a
    stable identity (`op:<opencode-project-id>` or `pid:<sha256-of-canonicalized-path>`)
    with rename/move aliases tracked per store, instead of a raw absolute path.
-2. **Export size cap.** `memory_export` is still unbounded in output size; with a
-   large store it can exhaust the model's context. Import is capped, export is
-   not. Same class of issue as #8.
+2. **Export size cap — shipped in 6.3.2.** `memory_export` is now bounded by
+   `maxEntries` (default 200, cap 1000) and `maxChars` (default 32000, cap 2000000);
+   truncated exports report `truncated` and `total`. Import was already capped
+   (8 MB / 5000 entries); export now gets the same context-protection.
 3. **Cross-project visibility.** `memory_export { scope: "all" }` plus an explicit-id
    `memory_reassign` is, together, a two-call primitive for moving another project's
    memory. That is inherent to having any cross-project recovery path; the wording
@@ -124,6 +126,19 @@ mutating tool (`memory_update`, `memory_forget`, `memory_prune` resolve through 
 shared `resolveMemoryId` before touching the vault), and a new `memory_upload` tool
 turns a readable file (image/PDF via OCR, or any text file) into a saved project memory,
 framed as untrusted data like web-derived text.
+
+---
+
+**Shipped in 6.3.2 — export cap.** `memory_export` is now bounded in output size,
+closing the last open context-exhaustion follow-up from the audit: with a large store
+the export used to be unbounded while import was already capped.
+
+- `memory_export { maxEntries }` — default 200 entries, hard cap 1000; an export over
+  that returns the first N and reports `truncated: true` with `total`.
+- `memory_export { maxChars }` — default 32000 serialized characters, hard cap 2000000;
+  entries are dropped from the tail until the payload fits.
+- A truncated export reports `truncated` and `total` in both the payload and the tool
+  metadata, so an agent can ask for a bigger window instead of silently losing data.
 
 ---
 
@@ -380,4 +395,5 @@ each historical fixture and asserts the v6 result.
 | **v6.2 (index)** — shipped | P2 #12 (inverted index, not FTS5 — see above) + P2 #16 (format/migrations) + #18 | Turns recall from O(corpus) rescan to a real index, and makes the store self-describing. Import (#6) and stats (#17) already landed, so this is purely the storage change. |
 | **v6.3 (scope + lifecycle)** — shipped | #7 stable project identity, plus the v6.2 accessibility wins (short ids, scope labels, `/remember` `/recall` `/forget` `/stats`, `memory_help`, `memory_inspect`) and `memory_reassign` short-id resolution | #7 routes the project key through a stable identity (`op:<id>` or `pid:<hash>`) with rename/moves aliased instead of a raw absolute path that goes stale. #5 (global scope done properly), #8 (caps/TTL + export cap) and #9 (agent scope) remain open. |
 | **v6.3.1 (agent usability)** — shipped | short ids for `memory_update` / `memory_forget` / `memory_prune`, plus new `memory_upload` | Closing the last gap between "the agent can save" and "the agent can use" what it saved: every mutator accepts a short id, and an uploaded file becomes a first-class memory. |
+| **v6.3.2 (export cap)** — shipped | bounded `memory_export` (default 200 entries / 32k chars, overridable via `maxEntries` / `maxChars`) + truncation metadata | Closes the last open context-exhaustion gap from the audit: an export used to be unbounded while import was capped. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
