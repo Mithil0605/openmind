@@ -8,7 +8,8 @@ the current tree, i.e. none of these are caught by the existing suite.
 ---
 
 
-## Status (as of 6.3.2)
+
+## Status (as of 6.3.3)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -96,9 +97,9 @@ versions into every user install; `npm audit --omit=dev` is now clean, and
 4. **Namespace orphan recovery.** In namespace mode (`ns:team`) no record looks like
    a filesystem path, so every foreign record is classified live and bulk recovery
    finds nothing. Needs its own notion of "the namespace no longer exists".
-5. **`useSessionProject` is not configurable.** The instance project always wins; a
-   user who deliberately moves a session to another checkout gets the old project's
-   memories. A documented option would make that intentional rather than surprising.
+5. **`useSessionProject` is not configurable — shipped in 6.3.3.** The option is now
+   documented and implemented: with `useSessionProject: true` the session's project
+   wins over the instance project.
 6. **Injection transparency, store versioning and the index** are no longer
    open: they shipped in 6.2.0 (below).
 
@@ -126,6 +127,12 @@ mutating tool (`memory_update`, `memory_forget`, `memory_prune` resolve through 
 shared `resolveMemoryId` before touching the vault), and a new `memory_upload` tool
 turns a readable file (image/PDF via OCR, or any text file) into a saved project memory,
 framed as untrusted data like web-derived text.
+
+---
+
+**Shipped in 6.3.3 — session-scoped project identity.** The plugin now accepts a
+`useSessionProject` option that makes the session's own project win over the
+plugin instance's pinned project.
 
 ---
 
@@ -396,4 +403,5 @@ each historical fixture and asserts the v6 result.
 | **v6.3 (scope + lifecycle)** — shipped | #7 stable project identity, plus the v6.2 accessibility wins (short ids, scope labels, `/remember` `/recall` `/forget` `/stats`, `memory_help`, `memory_inspect`) and `memory_reassign` short-id resolution | #7 routes the project key through a stable identity (`op:<id>` or `pid:<hash>`) with rename/moves aliased instead of a raw absolute path that goes stale. #5 (global scope done properly), #8 (caps/TTL + export cap) and #9 (agent scope) remain open. |
 | **v6.3.1 (agent usability)** — shipped | short ids for `memory_update` / `memory_forget` / `memory_prune`, plus new `memory_upload` | Closing the last gap between "the agent can save" and "the agent can use" what it saved: every mutator accepts a short id, and an uploaded file becomes a first-class memory. |
 | **v6.3.2 (export cap)** — shipped | bounded `memory_export` (default 200 entries / 32k chars, overridable via `maxEntries` / `maxChars`) + truncation metadata | Closes the last open context-exhaustion gap from the audit: an export used to be unbounded while import was capped. |
+| **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

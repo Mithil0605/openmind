@@ -301,6 +301,22 @@ To keep the password out of the config file entirely, point at a `0600` file:
 
 There is deliberately no `global` or `session` scope. Only project-scoped memories are stored; legacy global or session records created by earlier versions are ignored and never surfaced to a project. They are not lost, though — `memory_export` with `scope: "all"` includes them, and `memory_reassign` can adopt them into the current worktree.
 
+### Session-scoped project identity (v6.3.3)
+
+By default the OpenCode plugin instance pins the project it was created against, so a session that OpenCode later moves to another checkout still resolves to the original project.
+
+Opt in with the plugin option:
+
+```jsonc
+{
+  "plugins": [
+    { "type": "local", "path": "/path/to/opencode-memory", "options": { "useSessionProject": true } }
+  ]
+}
+```
+
+With `useSessionProject: true`, the project key is resolved from the session's own project (its OpenCode id when available, else a stable path identity for the session directory) instead of the instance project. Recall, list, update, forget, prune, and injection all follow the same resolution.
+
 ### Moving or renaming a project
 
 With **stable project identity** (v6.3), a memory no longer records a raw path that can go stale: the project key is a stable identity (`op:<opencode-project-id>` when the instance knows it, else a `pid:<sha256-of-realpath-prefix>` derived from the canonicalized path), with aliases tracked in the store so a rename or move keeps the memories.

@@ -1659,7 +1659,19 @@ function saveProjectIdentity(storeFile, identity) {
 function resolveProjectKey({ context, options, storageFile, namespace, instanceProjectID }) {
   // Namespace keys are stable and shared by design.
   if (namespace) return `ns:${namespace}`;
-  const dir = context?.worktree || context?.directory || process.cwd();
+  // v6.3.3: opt-in session-scoped project identity. By default the plugin
+  // instance's project wins (the instance is pinned at creation time); with
+  // `useSessionProject` the session's own project does instead, so a session
+  // deliberately moved to another checkout resolves to that project's memories.
+  let dir = context?.worktree || context?.directory || process.cwd();
+  if (options.useSessionProject) {
+    const sessionDir = context?.project?.directory || context?.worktree || context?.directory || process.cwd();
+    const sessionProjectID = context?.project?.id || instanceProjectID || null;
+    if (sessionProjectID && typeof sessionProjectID === "string" && sessionProjectID.trim()) {
+      return `op:${sessionProjectID.trim()}`;
+    }
+    if (sessionDir) dir = sessionDir;
+  }
   if (!dir) return dir;
   // Prefer OpenCode project id when available - most stable across renames/moves.
   if (instanceProjectID && typeof instanceProjectID === "string" && instanceProjectID.trim()) {
@@ -4037,7 +4049,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.3.2 — Quick help",
+            "OpenMind v6.3.3 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4071,6 +4083,7 @@ async execute(args, context) {
             "  - memory_recall supports time windows: last: '7d', after/before: ISO or epoch.",
             "  - If a store was moved/renamed, memory_reassign recovers stranded memories.",
             "  - Project identity is stable (op:/pid: keys, aliased by rename/move), so memories follow a checkout.",
+            "  - Set useSessionProject to true to key memory to the session's project instead of the instance project.",
             "  - Use memory_upload to turn an uploaded file (image/PDF/text) into a memory.",
           ].join("\n");
         },
