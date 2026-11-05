@@ -24,7 +24,7 @@ explicitly created it, and it belongs to the worktree it was created in.
 ```
 index.js              the whole plugin: tools, store, crypto, listen, image
 lib/imgread.py        image/PDF/OCR helper (invoked with an argv array, no shell)
-commands/             /listen and /imgread slash commands (copied by install.mjs)
+commands/             /listen, /imgread, /upload slash commands (copied by install.mjs)
 install.mjs           cross-platform setup: deps, plugin registration, commands
 install.sh/.cmd/.ps1  thin launchers around install.mjs
 test/                 verification suites (kept out of the published repo)

@@ -4049,7 +4049,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.3.3 — Quick help",
+            "OpenMind v6.3.4 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4071,7 +4071,7 @@ async execute(args, context) {
             "  listen_analyze {url,depth,permanent}              - fetch & analyze a page",
             "",
             "Slash commands (copied by installer):",
-            "  /remember <text>    /recall <query>    /stats    /forget <id>    /listen <url>    /imgread <path|url>",
+            "  /remember <text>    /recall <query>    /stats    /forget <id>    /listen <url>    /imgread <path|url>    /upload <path|url>",
             "",
             "Injection: pinned → relevance → recency, bounded by injectLimit/maxChars/itemMaxChars.",
             "Footer outside fence shows injected/dropped; toggle with injectionFooter:false or OPENMIND_INJECTION_FOOTER=0.",
