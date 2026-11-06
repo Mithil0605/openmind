@@ -254,7 +254,7 @@ An unusable `passwordFile` in the plugin config never prevents the plugin from l
 
 On a new store this sets the password and encrypts it; on an existing plaintext store it migrates the contents to the encrypted format in place.
 
-- Encrypted files start with the `OPENMIND_ENC_V3` header, then a `scrypt,n=<N>,r=<R>,p=<P>` line recording the key-derivation parameters used for that file, then `salt:iv:authTag:ciphertext` (AES-256-GCM, keyed by scrypt). Recording the parameters means a future cost increase never invalidates an existing store. Older `OPENMIND_ENC_V2` files are still readable and are transparently migrated to v3 on the next successful unlock.
+- Encrypted files start with the `OPENMIND_ENC_V4` header, then an `argon2id,m=<M>,t=<T>,p=<P>` line recording the key-derivation parameters used for that file, then `salt:iv:authTag:ciphertext` (AES-256-GCM, keyed by Argon2id). Recording the parameters means a future KDF change never invalidates an existing store. Older `OPENMIND_ENC_V3` files (scrypt) and `OPENMIND_ENC_V2` files (weaker scrypt) are still readable and are transparently re-keyed to Argon2id on the next successful unlock.
 - Wrong passwords are counted. After 5 failed attempts, access is locked for 5 minutes. `memory_unlock` reports the number of attempts remaining. Only the interactive unlock counts as an attempt: an ambient `OPENCODE_MEMORY_PASSWORD` that fails to decrypt does not burn the budget.
 - While locked, read and write tools answer with instructions to run `memory_unlock` instead of exposing data.
 

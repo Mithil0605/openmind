@@ -2,7 +2,7 @@ import { mkdir, open, readFile, rename, rm, stat, lstat } from "node:fs/promises
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname, platform, tmpdir } from "node:os";
-import { randomBytes, randomUUID, scrypt, createCipheriv, createDecipheriv, createHash } from "node:crypto";
+import { randomBytes, randomUUID, scrypt, createCipheriv, createDecipheriv, createHash, argon2 } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -893,11 +893,17 @@ const LOCKOUT_MS = 5 * 60 * 1000;
 const LOCKOUT_FILE = "lockout.json";
 
 // Encrypted store format:
+//   OPENMIND_ENC_V4
+//   argon2id,m=<M>,t=<T>,p=<P>          <- KDF parameters used for this file
+//   <salt>:<iv>:<authTag>:<ciphertext>
 //   OPENMIND_ENC_V3
 //   scrypt,n=<N>,r=<R>,p=<P>          <- KDF parameters used for this file
 //   <salt>:<iv>:<authTag>:<ciphertext>
-// Legacy OPENMIND_ENC_V2 files (no KDF line, weaker scrypt cost) are still
-// readable and are transparently migrated to v3 on the next successful unlock.
+//   OPENMIND_ENC_V2 files (no KDF line, weaker scrypt cost) are still readable
+//   and are transparently migrated to the current KDF on the next successful
+//   unlock. The current KDF is Argon2id (format v4); the scrypt tiers (v2/v3) are
+//   the legacy tier and migrate on unlock.
+const ENC_V4_HEADER = "OPENMIND_ENC_V4\n";
 const ENC_V3_HEADER = "OPENMIND_ENC_V3\n";
 const ENC_V2_HEADER = "OPENMIND_ENC_V2\n";
 
@@ -979,11 +985,29 @@ function pendingStoreMigrations(version) {
   return STORE_MIGRATIONS.filter((step) => step.from >= version);
 }
 
-// Stronger-than-default scrypt cost. Derived keys are cached per
+// KDF layer versions. v2 is Argon2id (current); v1 is scrypt (legacy tier, used
+// by the v2/v3 encrypted store formats). Derived keys are cached per
 // (password, salt, params) and each store reuses its own salt, so re-encrypting
 // the same store (every save) never pays the KDF cost twice.
-const KDF_PARAMS = { n: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
-const LEGACY_KDF_PARAMS = { n: 1 << 15, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+const ARGON2_ID = "argon2id";
+const KDF_VERSION = 2;
+const LEGACY_KDF_VERSION = 1;
+const KDF_PARAMS = { kdf: ARGON2_ID, version: KDF_VERSION, m: 65536, t: 3, p: 1, maxmem: 256 * 1024 * 1024 };
+const LEGACY_KDF_PARAMS = { kdf: "scrypt", version: LEGACY_KDF_VERSION, n: 1 << 15, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+
+// The KDF version a stored file's params were written with.
+function kdfVersionOf(params) {
+  if (!params) return LEGACY_KDF_VERSION;
+  if (params.kdf === ARGON2_ID) return KDF_VERSION;
+  if (params.kdf === "scrypt") return LEGACY_KDF_VERSION;
+  return LEGACY_KDF_VERSION;
+}
+
+// True when the stored KDF is older than the current one; the store is then
+// re-encrypted with the current KDF on the next successful unlock/save.
+function needsKdfUpgrade(params) {
+  return kdfVersionOf(params) < KDF_VERSION;
+}
 
 const LOCK_MSG =
   "OpenMind: the memory store is encrypted and locked. Call memory_unlock with your password to access saved preferences.";
@@ -1158,7 +1182,7 @@ async function withFileLock(lockPath, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Encryption (AES-256-GCM keyed by scrypt) and on-disk format.
+// Encryption (AES-256-GCM keyed by the current KDF: Argon2id, or scrypt for legacy stores) and on-disk format.
 // Encrypted files carry the KDF parameters in their header so future parameter
 // bumps never invalidate existing stores; v2 files use the legacy parameters.
 // ---------------------------------------------------------------------------
@@ -1181,7 +1205,9 @@ function clearKeyCache(file) {
 function keyTag(password, salt, p) {
   // The cache tag must never contain the plaintext password: a Map key keeps the
   // string alive independently of the vault's own reference. Hash it instead.
-  return `${createHash("sha256").update(password).digest("hex")}:${salt.toString("base64")}:${p.n}:${p.r}:${p.p}`;
+  const costKey = p.kdf === ARGON2_ID ? `${p.m}:${p.t}:${p.p}` : `${p.n}:${p.r}:${p.p}`;
+  const kdfKey = `${p.kdf ?? "scrypt"}:${p.version ?? LEGACY_KDF_VERSION}`;
+  return `${createHash("sha256").update(password).digest("hex")}:${salt.toString("base64")}:${kdfKey}:${costKey}`;
 }
 
 // Async scrypt on purpose. The sync variant blocks the opencode event loop for
@@ -1194,9 +1220,35 @@ async function deriveKey(file, password, salt, params) {
   const cached = keyCache.get(tag);
   if (cached) return cached;
   const derivation = new Promise((resolve, reject) => {
-    scrypt(password, salt, 32, { N: p.n, r: p.r, p: p.p, maxmem: p.maxmem }, (err, derived) =>
-      err ? reject(err) : resolve(derived),
-    );
+    if (p.kdf === ARGON2_ID) {
+      // Argon2id via the built-in OpenSSL-backed KDF, via callback because the
+      // sync variant would block the opencode event loop on every cache miss.
+      // The nonce is derived deterministically from (password, salt) so the key
+      // is reproducible across processes for the same store and password - Argon2
+      // takes the nonce as an input, unlike scrypt.
+      const nonceSource = createHash("sha256").update(`${String(password)}\u0000${salt.toString("base64")}`).digest();
+      argon2(
+        ARGON2_ID,
+        {
+          message: Buffer.from(String(password), "utf8"),
+          salt,
+          nonce: nonceSource.subarray(0, 16),
+          parallelism: 1,
+          tagLength: 32,
+          memory: p.m,
+          passes: p.t,
+          secret: Buffer.from(String(password), "utf8"),
+          associatedData: Buffer.alloc(0),
+          type: ARGON2_ID,
+          async: true,
+        },
+        (err, derived) => (err ? reject(err) : resolve(derived)),
+      );
+    } else {
+      scrypt(password, salt, 32, { N: p.n, r: p.r, p: p.p, maxmem: p.maxmem }, (err, derived) =>
+        err ? reject(err) : resolve(derived),
+      );
+    }
   });
   if (keyCache.size >= 64) keyCache.clear();
   // Cache the promise, not the resolved key, so concurrent callers await one
@@ -1211,13 +1263,24 @@ async function deriveKey(file, password, salt, params) {
 }
 
 function kdfParamsFromLine(line) {
-  const m = /^scrypt,n=(\d+),r=(\d+),p=(\d+)$/.exec(String(line || "").trim());
-  if (!m) return null;
-  const n = Number(m[1]);
-  const r = Number(m[2]);
-  const p = Number(m[3]);
-  if (!Number.isInteger(n) || !Number.isInteger(r) || !Number.isInteger(p) || n < 1 << 14 || r < 1 || p < 1) return null;
-  return { n, r, p, maxmem: Math.max(64 * 1024 * 1024, 128 * n * r * 2) };
+  const text = String(line || "").trim();
+  let m = /^argon2id,m=(\d+),t=(\d+),p=(\d+)$/.exec(text);
+  if (m) {
+    const mm = Number(m[1]);
+    const t = Number(m[2]);
+    const p = Number(m[3]);
+    if (!Number.isInteger(mm) || !Number.isInteger(t) || !Number.isInteger(p) || mm < 1024 || t < 1 || p < 1) return null;
+    return { kdf: ARGON2_ID, version: KDF_VERSION, m: mm, t, p, maxmem: Math.max(64 * 1024 * 1024, mm * 4) };
+  }
+  m = /^scrypt,n=(\d+),r=(\d+),p=(\d+)$/.exec(text);
+  if (m) {
+    const n = Number(m[1]);
+    const r = Number(m[2]);
+    const p = Number(m[3]);
+    if (!Number.isInteger(n) || !Number.isInteger(r) || !Number.isInteger(p) || n < 1 << 14 || r < 1 || p < 1) return null;
+    return { kdf: "scrypt", version: LEGACY_KDF_VERSION, n, r, p, maxmem: Math.max(64 * 1024 * 1024, 128 * n * r * 2) };
+  }
+  return null;
 }
 
 async function encryptPayload(file, password, entries, params, salt, version = STORE_VERSION) {
@@ -1249,6 +1312,13 @@ async function decryptPayload(file, payload, password, params) {
 }
 
 function parseEncrypted(raw) {
+  if (raw.startsWith(ENC_V4_HEADER)) {
+    const lines = raw.split("\n");
+    const params = kdfParamsFromLine(lines[1]);
+    if (!params) return { corrupt: true };
+    const payload = lines.slice(2).join("\n").trim();
+    return { params, salt: payload.split(":")[0], payload, legacy: false };
+  }
   if (raw.startsWith(ENC_V3_HEADER)) {
     const lines = raw.split("\n");
     const params = kdfParamsFromLine(lines[1]);
@@ -1295,10 +1365,17 @@ async function writeAtomic(file, body) {
   await rename(tmp, file);
 }
 
+function kdfHeader(params) {
+  if (params?.kdf === ARGON2_ID) {
+    return `${ENC_V4_HEADER}argon2id,m=${params.m},t=${params.t},p=${params.p}\n`;
+  }
+  return `${ENC_V3_HEADER}scrypt,n=${params.n},r=${params.r},p=${params.p}\n`;
+}
+
 async function writeEncrypted(file, password, entries, opts = {}) {
   const params = opts.params || KDF_PARAMS;
   const { payload, salt } = await encryptPayload(file, password, entries, params, opts.salt || null);
-  const body = `${ENC_V3_HEADER}scrypt,n=${params.n},r=${params.r},p=${params.p}\n${payload}\n`;
+  const body = `${kdfHeader(params)}${payload}\n`;
   await writeAtomic(file, body);
   return salt;
 }
@@ -1509,7 +1586,7 @@ async function loadVault(file, autoPassword) {
       let salt = raw.salt;
       let params = raw.params;
       let version = body.version;
-      if (raw.legacy || version < STORE_VERSION) {
+      if (raw.legacy || version < STORE_VERSION || needsKdfUpgrade(raw.params)) {
         // Upgrading on load is safe here only because the password was already
         // proven: the store is re-encrypted with the current KDF and the current
         // envelope in one atomic write.
@@ -3538,7 +3615,7 @@ async execute(args, context) {
                   const entries = body.entries.map(sanitizeEntry).filter(Boolean);
                   let salt = raw.salt;
                   let params = raw.params;
-                  if (raw.legacy) {
+                  if (raw.legacy || needsKdfUpgrade(raw.params)) {
                     salt = await writeEncrypted(file, password, entries);
                     params = KDF_PARAMS;
                   }
@@ -4049,7 +4126,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.3.4 — Quick help",
+            "OpenMind v6.4.0 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4457,10 +4534,16 @@ export {
   encryptPayload,
   writeEncrypted,
   readStoreRaw,
+  ENC_V4_HEADER,
   ENC_V3_HEADER,
   ENC_V2_HEADER,
   KDF_PARAMS,
   LEGACY_KDF_PARAMS,
+  ARGON2_ID,
+  KDF_VERSION,
+  LEGACY_KDF_VERSION,
+  kdfVersionOf,
+  needsKdfUpgrade,
   STORE_VERSION,
   // v6.2 search index: exported so the parity suite can assert the indexed
   // scorer and the full scan return identical results, and that document

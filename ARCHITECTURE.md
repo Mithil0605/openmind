@@ -109,7 +109,7 @@ into a readable tool result instead of breaking the turn.
   exact match. There is deliberately no global or session scope.
 - **Format** — versioned JSONL (`STORE_VERSION = 6`). The first line is a
   marker, `{"openmind":6}`, followed by one JSON object per line. Encrypted
-  stores begin with `OPENMIND_ENC_V3`, an `scrypt` parameter line, and
+  stores begin with `OPENMIND_ENC_V4`, an `argon2id` parameter line, and
   `salt:iv:authTag:ciphertext` (AES-256-GCM) whose plaintext is
   `{"openmind":6,"entries":[...]}`. The version is known *before* entries are
   parsed, which is what makes refusal possible: a store declaring a version this
@@ -126,9 +126,10 @@ into a readable tool result instead of breaking the turn.
 
 - **Migrations** — `STORE_MIGRATIONS` is an ordered ladder of named steps
   (v5 plaintext → v6 on next write, v5 encrypted → v6 on first successful
-  decrypt, legacy v2 KDF → v6 on load). `pendingStoreMigrations` reports what a
-  store would still need, and `memory_stats` surfaces it. Each reader and writer
-  checks `storeRefusal` first, so an unsupported store fails closed at every
+  decrypt, legacy v2 KDF → v6 on load). The KDF layer moved from scrypt (v1) to
+  Argon2id (v2) under format v4: an encrypted store written by the scrypt tier is
+  transparently re-keyed to Argon2id on the next successful unlock. Each reader and
+  writer checks `storeRefusal` first, so an unsupported store fails closed at every
   entry point instead of at the one that happened to parse it.
 
 ## 6. Concurrency
