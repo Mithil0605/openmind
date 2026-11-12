@@ -129,7 +129,7 @@ Windows example:
 - `memory_recall`: search memories with BM25-style ranking; prefix a token with `-` to exclude memories containing it (a query made only of exclusions still returns the project's other memories, ordered by pin and recency). Narrow by time with `last` (`7d`), `after` or `before`
 - `memory_list`: list recent memories; accepts the same `last` / `after` / `before` window
 - `memory_tags`: list the tags in use for this project, most frequent first, with counts — the fastest way to find the vocabulary before a tagged recall
-- `memory_stats`: report store health and shape: path, encryption state, size, store format and pending migrations, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, tag histogram, and whether the search index is built (document and term counts). It distinguishes an empty store from a locked one from memories stranded under another project path
+- `memory_stats`: report store health and shape: path, encryption state, size, store format and pending migrations, the active key-derivation function (Argon2id or scrypt) with any pending KDF upgrade, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, tag histogram, and whether the search index is built (document and term counts). It distinguishes an empty store from a locked one from memories stranded under another project path
 - `memory_unlock`: verify the store password to enable encryption or access an encrypted store (5-attempt rate limit). Takes `passwordFile` (preferred) or `password`
 - `memory_forget`: permanently delete a memory by id
 - `memory_prune`: preview then permanently delete unwanted memories by id, text, or tag

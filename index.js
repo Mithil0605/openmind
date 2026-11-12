@@ -2467,6 +2467,8 @@ function buildStats(vault, key, file, bytes, ctxDir = null) {
     // hidden behind a rebuild: the next successful write completes the upgrade.
     format: vault.version ?? STORE_VERSION,
     pendingMigrations: pendingStoreMigrations(vault.version ?? STORE_VERSION).map((step) => step.name),
+    kdf: vault.params?.kdf || null,
+    kdfUpgradePending: Boolean(vault.params) && needsKdfUpgrade(vault.params),
     // Index health: -1 means "not built yet in this process" (it is built
     // lazily by the first recall), otherwise the number of indexed documents.
     indexDocs: vault.index ? vault.index.docs.size : -1,
@@ -2483,6 +2485,7 @@ function formatStats(stats, key) {
     `  exists: ${stats.exists ? "yes" : "no (empty store)"}   size: ${stats.size}`,
     `  encryption: ${stats.encrypted ? "on (AES-256-GCM)" : "off (plaintext)"}   mode: ${stats.mode}`,
     `  format: v${stats.format}${stats.pendingMigrations.length ? ` (upgrades to v${STORE_VERSION} on the next write)` : " (current)"}`,
+    `  kdf: ${stats.kdf ?? "none (plaintext)"}${stats.kdfUpgradePending ? " (upgrade pending -> Argon2id)" : ""}`,
     `  current project: ${key ?? "(none)"}`,
     `  memories: ${stats.total} total, ${stats.visible} visible here, ${stats.pinned} pinned (visible)`,
   ];
@@ -3414,6 +3417,8 @@ let startupWarning = "";
                   tags: stats.tags.length,
                   format: stats.format,
                   pendingMigrations: stats.pendingMigrations,
+                  kdf: stats.kdf,
+                  kdfUpgradePending: stats.kdfUpgradePending,
                   indexDocs: stats.indexDocs,
                   indexTerms: stats.indexTerms,
                   indexLimited: stats.indexLimited,
@@ -4126,7 +4131,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.4.0 — Quick help",
+            "OpenMind v6.4.1 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",

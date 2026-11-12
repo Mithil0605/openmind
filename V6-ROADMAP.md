@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 6.4.0)
+## Status (as of 6.4.1)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -135,6 +135,10 @@ moved from scrypt (`n=2^17, r=8, p=1`, format v3) to Argon2id (`m=64 MiB, t=3, p
 format v4). The new format carries the Argon2id parameters in its header, and a
 store written by the scrypt tier is transparently re-keyed to Argon2id on the next
 successful unlock, so existing users keep working with no action.
+
+**Shipped in 6.4.1 — stats KDF reporting.** `memory_stats` now reports the active
+key-derivation function (Argon2id or scrypt, `none` for plaintext) and whether a KDF
+upgrade is pending, closing the diagnostics gap the re-key left behind.
 
 ---
 
@@ -410,5 +414,6 @@ each historical fixture and asserts the v6 result.
 | **v6.3.1 (agent usability)** — shipped | short ids for `memory_update` / `memory_forget` / `memory_prune`, plus new `memory_upload` | Closing the last gap between "the agent can save" and "the agent can use" what it saved: every mutator accepts a short id, and an uploaded file becomes a first-class memory. |
 | **v6.3.2 (export cap)** — shipped | bounded `memory_export` (default 200 entries / 32k chars, overridable via `maxEntries` / `maxChars`) + truncation metadata | Closes the last open context-exhaustion gap from the audit: an export used to be unbounded while import was capped. |
 | **v6.4 (KDF)** — shipped | Argon2id re-key (`OPENMIND_ENC_V4`, `m=64 MiB, t=3, p=1`) + transparent re-key from scrypt on unlock | Closes the last open cryptographic-upgrade follow-up from the audit: the scrypt tier is replaced by memory-hard Argon2id, existing stores re-key on the next successful unlock. |
+| **v6.4.1 (stats KDF)** — shipped | `memory_stats` reports the active KDF + pending-upgrade flag | Closes the diagnostics gap left by the v6.4.0 KDF re-key. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
