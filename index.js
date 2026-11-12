@@ -1269,8 +1269,14 @@ function kdfParamsFromLine(line) {
     const mm = Number(m[1]);
     const t = Number(m[2]);
     const p = Number(m[3]);
-    if (!Number.isInteger(mm) || !Number.isInteger(t) || !Number.isInteger(p) || mm < 1024 || t < 1 || p < 1) return null;
-    return { kdf: ARGON2_ID, version: KDF_VERSION, m: mm, t, p, maxmem: Math.max(64 * 1024 * 1024, mm * 4) };
+    const valid = Number.isInteger(mm) && Number.isInteger(t) && Number.isInteger(p) && mm >= 1024 && t >= 1 && p >= 1;
+    if (!valid) return null;
+    // Clamp to absolute bounds so a tampered or future header cannot drive an
+    // unbounded derivation; Argon2 `m` is denominated in KiB, `t` in iterations.
+    const mKiB = Math.min(mm, 1024 * 1024);
+    const passes = Math.min(t, 10);
+    const parallelism = Math.min(p, 4);
+    return { kdf: ARGON2_ID, version: KDF_VERSION, m: mKiB, t: passes, p: parallelism, maxmem: Math.max(64 * 1024 * 1024, mKiB * 1024 * 4) };
   }
   m = /^scrypt,n=(\d+),r=(\d+),p=(\d+)$/.exec(text);
   if (m) {
@@ -3614,30 +3620,13 @@ async execute(args, context) {
                 }
               }
               if (raw.kind === "encrypted") {
+                // Only the decrypt step is guarded: an authentication failure (or a
+                // malformed body) is a wrong-password outcome. The transparent re-key
+                // and the success bookkeeping stay outside so an I/O error there is not
+                // misreported (or mis-counted) as a failed password.
+                let body = null;
                 try {
-                  const body = unpackStoreBody(await decryptPayload(file, raw.payload, password, raw.params));
-                  if (!body) return "OpenMind: the store body is malformed and cannot be unlocked.";
-                  const entries = body.entries.map(sanitizeEntry).filter(Boolean);
-                  let salt = raw.salt;
-                  let params = raw.params;
-                  if (raw.legacy || needsKdfUpgrade(raw.params)) {
-                    salt = await writeEncrypted(file, password, entries);
-                    params = KDF_PARAMS;
-                  }
-                  setVault(file, {
-                    file,
-                    mode: "encrypted",
-                    entries,
-                    encrypted: true,
-                    password,
-                    mtimeMs: (await stat(file)).mtimeMs,
-                    salt,
-                    params,
-                  });
-                  // The derived key belonged to the rejected password, not this one.
-                  clearKeyCache(file);
-                  await recordSuccess(file);
-                  return `OpenMind store unlocked. ${entries.length} memory item(s) available.`;
+                  body = unpackStoreBody(await decryptPayload(file, raw.payload, password, raw.params));
                 } catch {
                   await recordFailure(file);
                   const lockedSeconds = await lockedOutFor(file);
@@ -3645,6 +3634,28 @@ async execute(args, context) {
                   const remaining = MAX_ATTEMPTS - (await readLockout(file)).count;
                   return `Incorrect password. ${Math.max(0, remaining)} attempt(s) remaining.`;
                 }
+                if (!body) return "OpenMind: the store body is malformed and cannot be unlocked.";
+                const entries = body.entries.map(sanitizeEntry).filter(Boolean);
+                let salt = raw.salt;
+                let params = raw.params;
+                if (raw.legacy || needsKdfUpgrade(raw.params)) {
+                  salt = await writeEncrypted(file, password, entries);
+                  params = KDF_PARAMS;
+                }
+                setVault(file, {
+                  file,
+                  mode: "encrypted",
+                  entries,
+                  encrypted: true,
+                  password,
+                  mtimeMs: (await stat(file)).mtimeMs,
+                  salt,
+                  params,
+                });
+                // The derived key belonged to the rejected password, not this one.
+                clearKeyCache(file);
+                await recordSuccess(file);
+                return `OpenMind store unlocked. ${entries.length} memory item(s) available.`;
               }
               if (raw.kind === "missing") {
                 const salt = await writeEncrypted(file, password, []);
@@ -4131,7 +4142,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.4.1 — Quick help",
+            "OpenMind v6.4.2 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
