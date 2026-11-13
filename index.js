@@ -2259,7 +2259,68 @@ function inTimeWindow(memory, window) {
   return true;
 }
 
-function filterMemories(memories, key, args = {}, index = null, dir = null) {
+// v6.5: local embedding seam for semantic / hybrid recall. The default backend
+// is unset in this release; the local model wiring lands with the first embedder
+// implementation, and until then semantic / hybrid recall reports it clearly instead
+// of silently degrading to keyword results.
+let semanticEmbedder = null;
+
+async function embedTexts(texts) {
+  if (!semanticEmbedder) return null;
+  const vectors = await semanticEmbedder(texts);
+  if (!Array.isArray(vectors) || vectors.length !== texts.length) return null;
+  return vectors;
+}
+
+function setSemanticEmbedder(fn) {
+  semanticEmbedder = typeof fn === "function" ? fn : null;
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  if (!denom) return 0;
+  return dot / denom;
+}
+
+function recallTokens(text) {
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+// v6.5: reciprocal rank fusion. Each ranking contributes 1/(k + rank + 1) per
+// entry; the fused score is the sum across rankings, which needs no score
+// calibration between the lexical and the embedding ranker.
+function reciprocalRankFusion(rankings, limit = 50, k = 60) {
+  const acc = new Map();
+  for (const ranking of rankings) {
+    const seen = new Set();
+    for (let i = 0; i < ranking.length; i += 1) {
+      const entry = ranking[i];
+      const id = String(entry?.id || `${entry?.updatedAt || ""}|${entry?.text || ""}`);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const prev = acc.get(id) || { score: 0, entry };
+      prev.score += 1 / (k + i + 1);
+      prev.entry = entry;
+      acc.set(id, prev);
+    }
+  }
+  const fused = [...acc.values()].sort((a, b) => b.score - a.score);
+  return fused.slice(0, limit).map((item) => item.entry);
+}
+
+async function filterMemories(memories, key, args = {}, index = null, dir = null) {
   const tags = asArray(args.tags);
   const rawQuery = String(args.query || "").trim();
   const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
@@ -2278,10 +2339,14 @@ function filterMemories(memories, key, args = {}, index = null, dir = null) {
   }
 
   const tagged = tags.length
-    ? candidates.filter((memory) =>
-        tags.some((tag) => (memory.tags || []).some((entryTag) => entryTag.toLowerCase() === tag.toLowerCase())),
-      )
+    ? candidates.filter((memory) => tags.some((tag) => (memory.tags || []).some((entryTag) => entryTag.toLowerCase() === tag.toLowerCase())))
     : candidates;
+
+  const rawMode = String(args?.mode || "keyword").trim().toLowerCase();
+  if (rawMode !== "keyword" && rawMode !== "semantic" && rawMode !== "hybrid") {
+    return { error: `OpenMind: mode must be one of keyword, semantic or hybrid (got "${rawMode}").` };
+  }
+  const mode = rawMode;
 
   if (positive.length === 0 && negative.length === 0) {
     return tagged
@@ -2289,40 +2354,84 @@ function filterMemories(memories, key, args = {}, index = null, dir = null) {
       .slice(0, limit);
   }
 
-  // Both scorers return the score and each entry's token set, so negation
-  // filtering does not have to re-tokenize every entry a second time. The index
-  // path only narrows which documents are scored: it produces the same numbers.
+  if (mode === "keyword") {
+    // Both scorers return the score and each entry's token set, so negation
+    // filtering does not have to re-tokenize every entry a second time. The index
+    // path only narrows which documents are scored: it produces the same numbers.
+    const scored = index ? bm25WithIndex(index, tagged, positive) : bm25Documents(tagged, positive);
+    const kept = scored.filter((doc) =>
+      negative.every((term) => {
+        if (doc.unique.has(term)) return false;
+        // The index stores both the raw token and its stem, so an exclusion has
+        // to consider both forms too.
+        return !doc.unique.has(stem(term));
+      }),
+    );
+    if (positive.length === 0) {
+      // A query made only of negated terms ("-windows") has nothing to rank by:
+      // every BM25 score is zero. The exclusions still apply, so the survivors
+      // are returned ordered by pinned first and recency second.
+      return kept
+        .sort((a, b) => Number(b.entry.pinned) - Number(a.entry.pinned) || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
+        .slice(0, limit)
+        .map(({ entry }) => entry);
+    }
+    return kept
+      .filter((doc) => doc.score > 0)
+      .map((doc) => ({
+        entry: doc.entry,
+        // A flat bonus would swamp BM25, whose scores live in roughly 0-10: a
+        // pinned memory matching one incidental term would outrank an exact match.
+        // A multiplier only reorders near-ties.
+        score: doc.score * (doc.entry.pinned ? PINNED_BOOST : 1),
+      }))
+      .sort((a, b) => b.score - a.score || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
+      .slice(0, limit)
+      .map(({ entry }) => entry);
+  }
+
+  // v6.5 semantic / hybrid recall: rank candidates with the embedding model and
+  // (hybrid only) fuse that ranking with the BM25 ranking via reciprocal rank
+  // fusion. Both modes need a query embedding; without one the tool reports it
+  // instead of silently degrading to keyword results.
+  const queryVectors = await embedTexts([rawQuery]);
+  const queryVector = Array.isArray(queryVectors) ? queryVectors[0] : null;
+  if (!Array.isArray(queryVector) || queryVector.length === 0) {
+    return { error: 'OpenMind: mode "semantic" or "hybrid" requires a local embedding model, and none is configured. Use mode "keyword".' };
+  }
+  const docVectors = (await embedTexts(tagged.map((memory) => String(memory.text || "")))) || [];
+  const semantic = [];
+  tagged.forEach((memory, i) => {
+    const vector = Array.isArray(docVectors[i]) ? docVectors[i] : null;
+    if (!vector || vector.length !== queryVector.length) return;
+    const score = cosineSimilarity(queryVector, vector);
+    if (score <= 0) return;
+    semantic.push({ entry: memory, score });
+  });
+  const semanticRanking = (negative.length ? semantic.filter((doc) => !negative.some((term) => recallTokens(String(doc.entry.text || "")).includes(term))) : semantic)
+    .map((doc) => ({ entry: doc.entry, score: doc.score * (doc.entry.pinned ? PINNED_BOOST : 1) }))
+    .sort((a, b) => b.score - a.score || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
+    .map((doc) => doc.entry)
+    .slice(0, limit);
+  if (mode === "semantic") {
+    return semanticRanking;
+  }
   const scored = index ? bm25WithIndex(index, tagged, positive) : bm25Documents(tagged, positive);
   const kept = scored.filter((doc) =>
     negative.every((term) => {
       if (doc.unique.has(term)) return false;
-      // The index stores both the raw token and its stem, so an exclusion has
-      // to consider both forms too.
       return !doc.unique.has(stem(term));
     }),
   );
-  if (positive.length === 0) {
-    // A query made only of negated terms ("-windows") has nothing to rank by:
-    // every BM25 score is zero. The exclusions still apply, so the survivors
-    // are returned ordered by pinned first and recency second.
-    return kept
-      .sort((a, b) => Number(b.entry.pinned) - Number(a.entry.pinned) || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
-      .slice(0, limit)
-      .map(({ entry }) => entry);
-  }
-  return kept
+  const keywordRanking = kept
     .filter((doc) => doc.score > 0)
-    .map((doc) => ({
-      entry: doc.entry,
-      // A flat bonus would swamp BM25, whose scores live in roughly 0-10: a
-      // pinned memory matching one incidental term would outrank an exact match.
-      // A multiplier only reorders near-ties.
-      score: doc.score * (doc.entry.pinned ? PINNED_BOOST : 1),
-    }))
+    .map((doc) => ({ entry: doc.entry, score: doc.score * (doc.entry.pinned ? PINNED_BOOST : 1) }))
     .sort((a, b) => b.score - a.score || b.entry.updatedAt.localeCompare(a.entry.updatedAt))
-    .slice(0, limit)
-    .map(({ entry }) => entry);
+    .map((doc) => doc.entry)
+    .slice(0, limit);
+  return reciprocalRankFusion([keywordRanking, semanticRanking], limit);
 }
+
 
 // Short IDs for human display. Full IDs are always accepted by mutators; we
 // only truncate for readability in lists/recall/results.
@@ -3332,11 +3441,12 @@ let startupWarning = "";
 
       memory_recall: tool({
         description:
-          "Search saved OpenMind preferences visible to this project using BM25-style ranking. Prefix a token with `-` to exclude memories containing it, e.g. query: \"tests -windows\". Narrow by time with `last` (7d), `after` or `before`.",
+          "Search saved OpenMind preferences visible to this project. Default mode is BM25-style ranking (keyword). Use mode \"semantic\" for embedding-based ranking or \"hybrid\" to fuse BM25 and embedding rankings. Prefix a token with `-` to exclude memories containing it, e.g. query: \"tests -windows\". Narrow by time with `last` (7d), `after` or `before`.",
         args: {
           query: tool.schema.string().optional().describe("Search text. Use -token to negate a term."),
           tags: tool.schema.array(tool.schema.string()).optional().describe("Hard filter: return only memories carrying one of these tags."),
           limit: tool.schema.number().int().min(1).max(50).optional().describe("Maximum memories to return."),
+          mode: tool.schema.string().optional().describe("Ranking mode: keyword (BM25 lexical, default), semantic (embedding-based), or hybrid (BM25 + embedding fused via reciprocal rank fusion)."),
           last: tool.schema.string().optional().describe("Only memories updated within this window, e.g. 30m, 12h, 7d, 2w, 1y."),
           after: tool.schema.string().optional().describe("Only memories updated at or after this time: ISO date (2026-10-01) or epoch."),
           before: tool.schema.string().optional().describe("Only memories updated at or before this time: ISO date (2026-10-01) or epoch."),
@@ -3348,7 +3458,7 @@ let startupWarning = "";
               const vault = getVault(file);
               const refusal = storeRefusal(vault);
               if (refusal) return refusal;
-              const memories = filterMemories(vault.entries, projectKey(context), args, recallIndex(vault, args), context?.worktree || context?.directory);
+              const memories = await filterMemories(vault.entries, projectKey(context), args, recallIndex(vault, args), context?.worktree || context?.directory);
               if (!Array.isArray(memories)) return memories.error;
               return memories.length ? memories.map(formatMemory).join("\n") : "No matching memories found.";
             }),
@@ -4142,7 +4252,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.4.2 — Quick help",
+            "OpenMind v6.5.0 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4571,4 +4681,8 @@ export {
   recallIndex,
   INDEX_MAX_DOCS,
   INDEX_MAX_POSTINGS,
+  // v6.5 semantic / hybrid recall seams.
+  embedTexts,
+  setSemanticEmbedder,
+  reciprocalRankFusion,
 };
