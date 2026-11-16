@@ -145,6 +145,13 @@ parser now clamps `m`/`t`/`p` to absolute bounds (fixing an unbounded-derivation
 unit error that would have broken the next legitimate KDF bump), and the unlock path no
 longer treats re-key write I/O failures as wrong-password outcomes.
 
+**Shipped in 6.5.0 — semantic / hybrid recall.** `memory_recall` gained the `mode`
+argument (`keyword` default, `semantic`, `hybrid`). Semantic ranking embeds query and
+candidate texts with the local Xenova MiniLM feature-extractor behind a lazy, in-process
+backend; hybrid mode fuses the embedding ranking with the BM25 ranking via reciprocal
+rank fusion. Without a reachable embedder the tool reports unavailability rather than
+degrading silently.
+
 ---
 
 **Shipped in 6.3.3 — session-scoped project identity.** The plugin now accepts a
@@ -341,7 +348,7 @@ rebuild from JSONL; lock contention with the existing file lock; encrypted store
 (plaintext index on disk would leak memory text — index must live inside the
 encrypted container or be rebuilt in a temp file and deleted).
 
-### 13. Semantic / hybrid recall — **in progress (v6.5.0)**
+### 13. Semantic / hybrid recall — **shipped in v6.5.0**
 
 Started: the recall tool now accepts a `mode` (`keyword` default, `semantic`,
 `hybrid`), ranks through a local embedding seam (`embedTexts` / `setSemanticEmbedder`),
@@ -429,6 +436,6 @@ each historical fixture and asserts the v6 result.
 | **v6.4 (KDF)** — shipped | Argon2id re-key (`OPENMIND_ENC_V4`, `m=64 MiB, t=3, p=1`) + transparent re-key from scrypt on unlock | Closes the last open cryptographic-upgrade follow-up from the audit: the scrypt tier is replaced by memory-hard Argon2id, existing stores re-key on the next successful unlock. |
 | **v6.4.1 (stats KDF)** — shipped | `memory_stats` reports the active KDF + pending-upgrade flag | Closes the diagnostics gap left by the v6.4.0 KDF re-key. |
 | **v6.4.2 (security)** — shipped | Argon2id KDF bounds clamp + unlock error scoping | Post-red-team patch before the npm publish: clamped KDF params and corrected unlock failure handling. |
-| **v6.5 (semantic)** — in progress | recall `mode` (keyword/semantic/hybrid) + RRF fusion + embedding seam | Recall gains semantic ranking and hybrid fusion behind a pluggable local embedder; the local model wiring lands next. |
+| **v6.5 (semantic)** — shipped | recall `mode` (keyword/semantic/hybrid) + RRF fusion + local MiniLM embedder | Semantic ranking and hybrid fusion shipped; local embedder is lazy-loaded in-process, unavailability is reported rather than silently degrading. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

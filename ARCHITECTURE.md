@@ -82,7 +82,7 @@ config shows a **path** entry rather than a package name.
 | --- | --- |
 | `memory_remember` | save/update one project memory (near-duplicates dedupe) |
 | `memory_update` | edit text/tags/source/pinned by id |
-| `memory_recall` | BM25 search, `-token` negation, tag filter, time window |
+| `memory_recall` | BM25 search, `-token` negation, tag filter, time window, ranking modes (`keyword` / `semantic` / `hybrid`) |
 | `memory_list` | recent memories for this project, time window |
 | `memory_tags` | tag inventory with counts, most frequent first |
 | `memory_stats` | store health: path, size, encryption, counts, tags |
@@ -149,6 +149,12 @@ carries its own token. This is covered by the concurrency verification suite.
   terms match verbatim or stemmed, by prefix, or with one edit inside words of
   five or more characters. Negated `-terms` exclude. The recorded project path is
   never indexed, so a query naming the directory does not match everything.
+- **Semantic / hybrid (v6.5.0)** — `memory_recall` accepts `mode` (`keyword` default,
+  `semantic`, `hybrid`). Semantic ranking embeds the query and candidate texts with
+  the local Xenova MiniLM feature-extractor (lazily loaded, local HF cache, no network
+  at query time) and ranks by cosine similarity; hybrid fuses the embedding ranking
+  with the BM25 ranking via reciprocal rank fusion. Without a reachable embedder the
+  tool reports unavailability instead of degrading to keyword results.
 - **Index** — an in-memory inverted index (`buildMemoryIndex`) caches per-entry
   token bags and a term → entries postings map. It is built lazily on the first
   ranking recall (or the first injection pass), reused for the life of that store

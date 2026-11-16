@@ -2259,15 +2259,62 @@ function inTimeWindow(memory, window) {
   return true;
 }
 
-// v6.5: local embedding seam for semantic / hybrid recall. The default backend
-// is unset in this release; the local model wiring lands with the first embedder
-// implementation, and until then semantic / hybrid recall reports it clearly instead
-// of silently degrading to keyword results.
-let semanticEmbedder = null;
+// v6.5: local embedding backend for semantic / hybrid recall. The default backend
+// is the in-process Xenova MiniLM feature-extraction model loaded lazily from the
+// local Hugging Face cache; an explicit backend can be installed with
+// setSemanticEmbedder (null disables it, which is how the test suite pins the
+// no-embedder path). Until the model is reachable, semantic / hybrid recall reports
+// unavailability instead of silently degrading to keyword results.
+let semanticEmbedder = defaultLocalEmbedder;
+let localPipelinePromise = null;
+
+function getLocalPipeline() {
+  if (!localPipelinePromise) {
+    localPipelinePromise = (async () => {
+      const { pipeline, env } = await import("@xenova/transformers");
+      env.allowLocalModels = true;
+      const pipe = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+      return pipe;
+    })();
+  }
+  return localPipelinePromise;
+}
+
+async function defaultLocalEmbedder(texts) {
+  try {
+    const pipe = await getLocalPipeline();
+    const result = await pipe(texts);
+    const vectors = extractEmbedVectors(result, texts.length);
+    if (!vectors || vectors.length !== texts.length) return null;
+    return vectors;
+  } catch {
+    return null;
+  }
+}
+
+function extractEmbedVectors(result, expected) {
+  if (!result || typeof result !== "object") return null;
+  const dims = Array.isArray(result.dims) ? result.dims.map(Number) : [];
+  const raw = result.data;
+  if (!raw || typeof raw !== "object") return null;
+  const keys = Object.keys(raw).map(Number).sort((a, b) => a - b);
+  const flat = keys.map((key) => Number(raw[key]));
+  const dim = dims.length ? dims[dims.length - 1] : flat.length;
+  const batch = dims.length ? Number(dims[0]) : flat.length;
+  const vectors = [];
+  for (let i = 0; i < batch; i += 1) {
+    const start = i * dim;
+    const vector = flat.slice(start, start + dim);
+    if (vector.length === 0) return null;
+    vectors.push(vector);
+  }
+  if (vectors.length !== expected) return null;
+  return vectors;
+}
 
 async function embedTexts(texts) {
-  if (!semanticEmbedder) return null;
-  const vectors = await semanticEmbedder(texts);
+  const backend = semanticEmbedder;
+  const vectors = backend ? await backend(texts) : null;
   if (!Array.isArray(vectors) || vectors.length !== texts.length) return null;
   return vectors;
 }
