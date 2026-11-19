@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 6.6.0)
+## Status (as of 6.7.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -151,6 +151,11 @@ candidate texts with the local Xenova MiniLM feature-extractor behind a lazy, in
 backend; hybrid mode fuses the embedding ranking with the BM25 ranking via reciprocal
 rank fusion. Without a reachable embedder the tool reports unavailability rather than
 degrading silently.
+
+**Shipped in 6.7.0 — security audit gate.** SAST (Bandit on `lib/`, ESLint + syntax),
+DAST/VAPT (security / vapt / vapt2 / dast suites) and the full local suite sweep all
+pass on the v6.6.0 tree; no patches were required. Released behind a green security
+gate.
 
 ---
 
@@ -437,5 +442,6 @@ each historical fixture and asserts the v6 result.
 | **v6.4.1 (stats KDF)** — shipped | `memory_stats` reports the active KDF + pending-upgrade flag | Closes the diagnostics gap left by the v6.4.0 KDF re-key. |
 | **v6.4.2 (security)** — shipped | Argon2id KDF bounds clamp + unlock error scoping | Post-red-team patch before the npm publish: clamped KDF params and corrected unlock failure handling. |
 | **v6.5 (semantic)** — shipped | recall `mode` (keyword/semantic/hybrid) + RRF fusion + local MiniLM embedder | Semantic ranking and hybrid fusion shipped; local embedder is lazy-loaded in-process, unavailability is reported rather than silently degrading. |
+| **v6.7 (security gate)** — shipped | Bandit + security/VAPT/DAST suites green | Security audit pass (SAST Bandit, DAST/VAPT security/vapt/vapt2/dast) on the v6.6.0 tree; all green, no patches required. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
