@@ -892,6 +892,31 @@ const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 5 * 60 * 1000;
 const LOCKOUT_FILE = "lockout.json";
 
+// v6.6: soft store cap. The store is otherwise unbounded (every memory_remember
+// appends), so beyond this many entries the save path evicts the
+// least-recently-updated (and never pinned) memories before writing.
+const DEFAULT_MAX_MEMORIES = 10_000;
+
+function maxMemoriesFromEnv() {
+  const raw = process.env.OPENMIND_MAX_MEMORIES;
+  if (!raw) return DEFAULT_MAX_MEMORIES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_MEMORIES;
+  return Math.floor(parsed);
+}
+
+function evictForCap(entries, cap) {
+  const list = [...entries];
+  const excess = list.length - cap;
+  if (excess <= 0) return list;
+  const candidates = list
+    .filter((memory) => memory?.pinned !== true)
+    .sort((a, b) => String(a?.updatedAt || "").localeCompare(String(b?.updatedAt || "")));
+  const dropIds = new Set(candidates.slice(0, excess).map((memory) => memory?.id).filter(Boolean));
+  if (dropIds.size === 0) return list;
+  return list.filter((memory) => !memory || memory.id ? !dropIds.has(memory.id) : true);
+}
+
 // Encrypted store format:
 //   OPENMIND_ENC_V4
 //   argon2id,m=<M>,t=<T>,p=<P>          <- KDF parameters used for this file
@@ -2631,6 +2656,7 @@ function buildStats(vault, key, file, bytes, ctxDir = null) {
     pendingMigrations: pendingStoreMigrations(vault.version ?? STORE_VERSION).map((step) => step.name),
     kdf: vault.params?.kdf || null,
     kdfUpgradePending: Boolean(vault.params) && needsKdfUpgrade(vault.params),
+    maxMemories: maxMemoriesFromEnv(),
     // Index health: -1 means "not built yet in this process" (it is built
     // lazily by the first recall), otherwise the number of indexed documents.
     indexDocs: vault.index ? vault.index.docs.size : -1,
@@ -2648,6 +2674,7 @@ function formatStats(stats, key) {
     `  encryption: ${stats.encrypted ? "on (AES-256-GCM)" : "off (plaintext)"}   mode: ${stats.mode}`,
     `  format: v${stats.format}${stats.pendingMigrations.length ? ` (upgrades to v${STORE_VERSION} on the next write)` : " (current)"}`,
     `  kdf: ${stats.kdf ?? "none (plaintext)"}${stats.kdfUpgradePending ? " (upgrade pending -> Argon2id)" : ""}`,
+    `  max memories: ${stats.maxMemories} (soft cap; least-recent evicted when exceeded)`,
     `  current project: ${key ?? "(none)"}`,
     `  memories: ${stats.total} total, ${stats.visible} visible here, ${stats.pinned} pinned (visible)`,
   ];
@@ -3372,6 +3399,11 @@ let startupWarning = "";
         vault.entries.push(memory);
         outcome = { updated: false, memory };
       }
+      // v6.6: soft store cap — evict least-recent (never pinned) entries before
+      // writing, so a long-lived store cannot grow without bound.
+      const cap = maxMemoriesFromEnv();
+      const keptEntries = evictForCap(vault.entries, cap);
+      if (keptEntries.length !== vault.entries.length) vault.entries = keptEntries;
       if (!outcome.updated && vault.mode === "plaintext") {
         const appended = await appendPlaintextLine(file, outcome.memory);
         if (appended) {
@@ -3582,6 +3614,7 @@ let startupWarning = "";
                   pendingMigrations: stats.pendingMigrations,
                   kdf: stats.kdf,
                   kdfUpgradePending: stats.kdfUpgradePending,
+                  maxMemories: stats.maxMemories,
                   indexDocs: stats.indexDocs,
                   indexTerms: stats.indexTerms,
                   indexLimited: stats.indexLimited,

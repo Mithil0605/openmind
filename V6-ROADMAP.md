@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 6.4.2)
+## Status (as of 6.6.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
