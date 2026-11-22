@@ -55,7 +55,7 @@
     "url": "git+https://github.com/Mithil0605/openmind.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.33",
