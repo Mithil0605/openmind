@@ -25,4 +25,6 @@ tool.
 
 Notes: the tool honors robots.txt, refuses private/loopback/link-local and
 cloud-metadata hosts, executes no JavaScript, and follows no links — only the
-single URL given is fetched.
+single URL given is fetched. Results are cached per URL for the process lifetime
+(bounded, depth-aware); a repeat analysis of the same URL reuses the cached
+result instead of fetching and re-extracting.

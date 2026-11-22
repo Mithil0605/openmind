@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 6.7.0)
+## Status (as of 7.0.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -156,6 +156,12 @@ degrading silently.
 DAST/VAPT (security / vapt / vapt2 / dast suites) and the full local suite sweep all
 pass on the v6.6.0 tree; no patches were required. Released behind a green security
 gate.
+
+**Shipped in 7.0.0 — feature release: listen cache, agent scope, dedupe.** All three
+backlog features closed: `listen_analyze` gained a bounded per-URL result cache
+(depth-aware hits, cached results flagged, no re-fetch on repeat), memories became
+agent-namespaced when the saving context names an agent (P1 #9), and near-duplicate
+merging now also accepts stemmed token overlap (v7.0 consolidation).
 
 ---
 
@@ -443,5 +449,6 @@ each historical fixture and asserts the v6 result.
 | **v6.4.2 (security)** — shipped | Argon2id KDF bounds clamp + unlock error scoping | Post-red-team patch before the npm publish: clamped KDF params and corrected unlock failure handling. |
 | **v6.5 (semantic)** — shipped | recall `mode` (keyword/semantic/hybrid) + RRF fusion + local MiniLM embedder | Semantic ranking and hybrid fusion shipped; local embedder is lazy-loaded in-process, unavailability is reported rather than silently degrading. |
 | **v6.7 (security gate)** — shipped | Bandit + security/VAPT/DAST suites green | Security audit pass (SAST Bandit, DAST/VAPT security/vapt/vapt2/dast) on the v6.6.0 tree; all green, no patches required. |
+| **v7.0 (features)** — shipped | listen_analyze URL cache (P3 #19) + agent scope (P1 #9) + stemmed near-dup merge | All three backlog features shipped and released as v7.0.0. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

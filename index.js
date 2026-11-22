@@ -168,6 +168,19 @@ const LISTEN_MAX_REDIRECTS = 5;
 const LISTEN_USER_AGENT = "OpenMind-Listen/5.2 (privacy-first analysis)";
 const ALLOWED_PORTS = new Set([80, 443, 8000, 8080, 8443]);
 
+// v7.0: listen_analyze result cache. Keyed by normalized URL, value carries the
+// fetched page facts plus the built analysis, so a repeated analysis of the same
+// URL skips the network fetch, the robots lookup and the extraction entirely.
+// Bounded like the robots caches so a long-running session cannot grow it without limit.
+const LISTEN_CACHE_MAX = 128;
+const listenPageCache = new Map();
+
+function listenCacheKey(url) {
+  // Content-addressed key for the URL; the page content hash is recorded on the
+  // entry so cross-URL content dedupe stays observable.
+  return createHash("sha256").update(String(url)).digest("hex");
+}
+
 function ipv4ToInt(ip) {
   const parts = String(ip).split(".");
   if (parts.length !== 4) return null;
@@ -1765,6 +1778,18 @@ function saveProjectIdentity(storeFile, identity) {
 }
 
 function resolveProjectKey({ context, options, storageFile, namespace, instanceProjectID }) {
+  const base = resolveProjectKeyBase({ context, options, storageFile, namespace, instanceProjectID });
+  // v7.0: per-agent scope. When the calling context names an agent, that agent's
+  // memories for a project live under an agent-namespaced key, so one agent's
+  // preferences for a project stay separate from another agent's for the same
+  // project. Without an agent the the plain project key applies as before.
+  if (namespace) return base;
+  const agent = context?.agent ? String(context.agent).trim().toLowerCase() : "";
+  if (agent) return `${base ?? ""}::${agent}`;
+  return base;
+}
+
+function resolveProjectKeyBase({ context, options, storageFile, namespace, instanceProjectID }) {
   // Namespace keys are stable and shared by design.
   if (namespace) return `ns:${namespace}`;
   // v6.3.3: opt-in session-scoped project identity. By default the plugin
@@ -1813,10 +1838,18 @@ function resolveProjectKey({ context, options, storageFile, namespace, instanceP
 // ("op:...") there is no directory to check, which means the project may well
 // have moved - those are always treated as still existing.
 function projectDirectoryMissingFor(storageFile, key) {
-  if (typeof key === "string" && key.startsWith("pid:")) {
+  // v7.0: agent-scoped keys carry a `<stable-key>::<agent>` shape. Strip the
+  // agent suffix before the stable-key checks so orphan detection still resolves
+  // the underlying project identity.
+  let stableKey = key;
+  if (typeof key === "string" && (key.startsWith("pid:") || key.startsWith("op:"))) {
+    const sep = key.indexOf("::");
+    if (sep > 0) stableKey = key.slice(0, sep);
+  }
+  if (typeof stableKey === "string" && stableKey.startsWith("pid:")) {
     try {
       const identity = loadProjectIdentity(storageFile);
-      const entry = identity?.projects?.[key];
+      const entry = identity?.projects?.[stableKey];
       if (entry && Array.isArray(entry.paths)) {
         for (const path of entry.paths) {
           if (isFilesystemRoot(path)) return true;
@@ -1827,7 +1860,7 @@ function projectDirectoryMissingFor(storageFile, key) {
       }
     } catch {}
   }
-  return projectDirectoryMissing(key);
+  return projectDirectoryMissing(stableKey);
 }
 
 function compactProject(path) {
@@ -1960,9 +1993,19 @@ function isDuplicate(a, b) {
   const ta = new Set(tokenize(a));
   const tb = new Set(tokenize(b));
   if (!ta.size || !tb.size) return false;
-  let overlap = 0;
-  for (const term of ta) if (tb.has(term)) overlap += 1;
-  return overlap / (ta.size + tb.size - overlap) >= 0.8;
+  const jaccard = (setA, setB) => {
+    let overlap = 0;
+    for (const term of setA) if (setB.has(term)) overlap += 1;
+    const size = setA.size + setB.size - overlap;
+    return size > 0 ? overlap / size : 0;
+  };
+  if (jaccard(ta, tb) >= 0.8) return true;
+  // v7.0: second merging signal — stemmed token overlap, so inflection and
+  // compound-word wording differences still merge into one memory.
+  const stemmedA = new Set([...ta].map((term) => stem(term)));
+  const stemmedB = new Set([...tb].map((term) => stem(term)));
+  if (jaccard(stemmedA, stemmedB) >= 0.8) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -4332,7 +4375,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v6.7.0 — Quick help",
+            "OpenMind v7.0.0 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4451,7 +4494,7 @@ async execute(args, context) {
 
       listen_analyze: tool({
         description:
-          "Fetch a public web page and analyze it: title/description/author/keywords, Open Graph data, heading outline, visible text, links, images, code blocks, tables, lists and detected tech stack. depth:'quick' returns metadata + text only; depth:'full' (default) adds the structural sections. Set permanent:true to also save a summary of the findings to OpenMind memory for this project. robots.txt is honored. SSRF-guarded: private/loopback/link-local/cloud-metadata hosts are blocked. Only the given URL is fetched - links are listed, never followed - and JavaScript is not executed, so client-rendered pages may return little text.",
+          "Fetch a public web page and analyze it: title/description/author/keywords, Open Graph data, heading outline, visible text, links, images, code blocks, tables, lists and detected tech stack. depth:'quick' returns metadata + text only; depth:'full' (default) adds the structural sections. Set permanent:true to also save a summary of the findings to OpenMind memory for this project. robots.txt is honored. SSRF-guarded: private/loopback/link-local/cloud-metadata hosts are blocked. Only the given URL is fetched - links are listed, never followed - and JavaScript is not executed, so client-rendered pages may return little text. Results are cached per URL for this process (bounded cache) so repeat analyses of the same URL skip the fetch and re-extract.",
         args: {
           url: tool.schema.string().min(1).max(2000).describe("The http(s) URL of the website to analyze."),
           depth: tool.schema.enum(["quick", "full"]).optional().describe("'quick' for metadata, tech stack and text only; 'full' for everything including links, images, code, tables, lists (default: full)."),
@@ -4469,6 +4512,34 @@ async execute(args, context) {
             parsedUrl = await assertPublicHost(rawUrl);
           } catch (err) {
             return `SSRF blocked: ${err.message}`;
+          }
+
+          // v7.0: listen_analyze cache. Keyed by normalized URL + depth, bounded,
+          // process-lifetime like the robots caches. A hit skips robots, fetch and
+          // extraction entirely; the permanent-save dedupe is preserved through the
+          // stored savedId, so a cached analysis never re-saves.
+          const cacheKey = listenCacheKey(parsedUrl.href);
+          const cachedEntry = listenPageCache.get(cacheKey);
+          if (cachedEntry && cachedEntry.depth === (args.depth || "full")) {
+            const cached = cachedEntry;
+            const cachedFooter = cached.permanent
+              ? ""
+              : "\n\n---\n**Note:** one-time analysis. Re-run with permanent: true to save the findings to memory.";
+            const cachedSavedNote = cached.savedId ? `\n\n**Saved to OpenMind memory** as ${cached.savedId}.` : "";
+            return {
+              title: `Listen: ${cached.finalUrl}`,
+              output: cached.analysis + cached.spaNote + cachedFooter + cachedSavedNote,
+              metadata: {
+                url: cached.finalUrl,
+                status: cached.status,
+                contentType: cached.contentType,
+                depth: cached.depth,
+                permanent: cached.permanent,
+                savedId: cached.savedId,
+                htmlSize: cached.htmlSize,
+                cached: true,
+              },
+            };
           }
 
           // One wall-clock deadline for robots + page + redirects combined, so
@@ -4529,6 +4600,21 @@ async execute(args, context) {
             }
           }
 
+          const entry = {
+            finalUrl,
+            status,
+            contentType,
+            depth,
+            permanent,
+            analysis,
+            spaNote,
+            savedId,
+            htmlSize: html.length,
+          };
+          // v7.0: cache the successful analysis (bounded, cleared on overflow).
+          if (listenPageCache.size >= LISTEN_CACHE_MAX) listenPageCache.clear();
+          listenPageCache.set(listenCacheKey(parsedUrl.href), entry);
+
           return {
             title: `Listen: ${finalUrl}`,
             output: analysis + spaNote + footer + savedNote,
@@ -4540,6 +4626,7 @@ async execute(args, context) {
               permanent,
               savedId,
               htmlSize: html.length,
+              cached: false,
             },
           };
         },
@@ -4566,6 +4653,7 @@ async execute(args, context) {
       // directory - a moved session or a worktree session does not.
       const context = {
         sessionID: input.sessionID,
+        agent: input.agent ?? _input?.agent ?? null,
         directory: input.directory ?? _input.directory,
         worktree: input.worktree ?? _input.worktree,
       };
@@ -4693,6 +4781,7 @@ export default {
       await core["experimental.chat.system.transform"](
         {
           sessionID: event.sessionID,
+          agent: event.agent ?? null,
           model: {},
           directory: sessionDirectory,
           worktree: sessionDirectory,
@@ -4765,4 +4854,10 @@ export {
   embedTexts,
   setSemanticEmbedder,
   reciprocalRankFusion,
+  // v7.0 near-duplicate merging signal.
+  isDuplicate,
+  // v7.0 listen_analyze cache seams (tests drive the cache directly).
+  listenPageCache,
+  listenCacheKey,
+  LISTEN_CACHE_MAX,
 };
