@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 7.0.0)
+## Status (as of 7.0.1)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -162,6 +162,12 @@ backlog features closed: `listen_analyze` gained a bounded per-URL result cache
 (depth-aware hits, cached results flagged, no re-fetch on repeat), memories became
 agent-namespaced when the saving context names an agent (P1 #9), and near-duplicate
 merging now also accepts stemmed token overlap (v7.0 consolidation).
+
+**Shipped in 7.0.1 — patch: CI build fix.** The CI `Load check` failed on Node 22
+(`node:crypto` has no `argon2` export; the plugin requires Node >= 24 since the v6.4
+Argon2id KDF), and the package lockfile had drifted behind the version bumps. CI matrix
+moved to Node 24 and the lockfile was resynced; release tooling now ships behind a green
+build.
 
 ---
 
@@ -450,5 +456,6 @@ each historical fixture and asserts the v6 result.
 | **v6.5 (semantic)** — shipped | recall `mode` (keyword/semantic/hybrid) + RRF fusion + local MiniLM embedder | Semantic ranking and hybrid fusion shipped; local embedder is lazy-loaded in-process, unavailability is reported rather than silently degrading. |
 | **v6.7 (security gate)** — shipped | Bandit + security/VAPT/DAST suites green | Security audit pass (SAST Bandit, DAST/VAPT security/vapt/vapt2/dast) on the v6.6.0 tree; all green, no patches required. |
 | **v7.0 (features)** — shipped | listen_analyze URL cache (P3 #19) + agent scope (P1 #9) + stemmed near-dup merge | All three backlog features shipped and released as v7.0.0. |
+| **v7.0.1 (patch)** — shipped | CI node-24 + lockfile sync | Patch release: CI `Load check` green on Node 24, lockfile in sync with package.json. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |

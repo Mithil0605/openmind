@@ -4375,7 +4375,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v7.0.0 — Quick help",
+            "OpenMind v7.0.1 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
