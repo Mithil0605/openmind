@@ -181,6 +181,13 @@ function listenCacheKey(url) {
   return createHash("sha256").update(String(url)).digest("hex");
 }
 
+function contentDigest(text) {
+  // Content digest for memory-level dedupe: sha256 of the trimmed text, hex.
+  // Used by the listen_analyze permanent-save path to skip re-saving an
+  // unchanged summary whose content digest already exists in the store.
+  return createHash("sha256").update(String(text || "").trim()).digest("hex");
+}
+
 function ipv4ToInt(ip) {
   const parts = String(ip).split(".");
   if (parts.length !== 4) return null;
@@ -4375,7 +4382,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v7.0.1 — Quick help",
+            "OpenMind v7.2.0 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",
@@ -4583,20 +4590,34 @@ async execute(args, context) {
           let savedNote = "";
           let savedId = null;
           if (permanent) {
-            const saved = await saveMemory(
-              {
-                text: listenSummary(finalUrl, analysis),
-                tags: ["listen", "web", safeTag(hostOf(finalUrl))].filter(Boolean),
-                source: `listen_analyze ${finalUrl}`,
-                dedupe: true,
-              },
-              context,
+            const summaryText = String(listenSummary(finalUrl, analysis));
+            // v7.2: content-hash dedupe - skip the save when an existing visible
+            // memory already carries this exact content digest.
+            const digest = contentDigest(summaryText);
+            await ensureLoaded(file, autoPassword);
+            const loadedVault = getVault(file);
+            const existingDigestHit = loadedVault.entries.find(
+              (memory) => visibleToProject(memory, projectKey(context)) && contentDigest(memory.text) === digest,
             );
-            if (saved.error) {
-              savedNote = `\n\n**Memory save failed:** ${saved.error}`;
+            if (existingDigestHit) {
+              savedId = existingDigestHit.id;
+              savedNote = `\n\n**Saved to OpenMind memory** as ${existingDigestHit.id}.`;
             } else {
-              savedId = saved.memory.id;
-              savedNote = `\n\n**Saved to OpenMind memory** as ${saved.memory.id}.`;
+              const saved = await saveMemory(
+                {
+                  text: summaryText,
+                  tags: ["listen", "web", safeTag(hostOf(finalUrl))].filter(Boolean),
+                  source: `listen_analyze ${finalUrl}`,
+                  dedupe: true,
+                },
+                context,
+              );
+              if (saved.error) {
+                savedNote = `\n\n**Memory save failed:** ${saved.error}`;
+              } else {
+                savedId = saved.memory.id;
+                savedNote = `\n\n**Saved to OpenMind memory** as ${saved.memory.id}.`;
+              }
             }
           }
 
@@ -4860,4 +4881,6 @@ export {
   listenPageCache,
   listenCacheKey,
   LISTEN_CACHE_MAX,
+  // v7.2 listen_analyze content-digest seam (tests drive the digest).
+  contentDigest,
 };
