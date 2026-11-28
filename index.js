@@ -2668,6 +2668,19 @@ function formatBytes(count) {
   return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
+// v7.3: per-project breakdown of the visible memories, so memory_stats can
+// answer "how many memories belong to each project here" without another pass.
+function projectBreakdown(entries) {
+  const counts = new Map();
+  for (const memory of entries) {
+    const project = String(memory.project || "(unscoped)");
+    counts.set(project, (counts.get(project) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([project, count]) => ({ project, count }))
+    .sort((a, b) => b.count - a.count || String(a.project).localeCompare(String(b.project)));
+}
+
 function buildStats(vault, key, file, bytes, ctxDir = null) {
   const dir = ctxDir;
   const visible = vault.entries.filter((memory) => visibleToProject(memory, key, dir));
@@ -2707,6 +2720,7 @@ function buildStats(vault, key, file, bytes, ctxDir = null) {
     kdf: vault.params?.kdf || null,
     kdfUpgradePending: Boolean(vault.params) && needsKdfUpgrade(vault.params),
     maxMemories: maxMemoriesFromEnv(),
+    projects: projectBreakdown(visible),
     // Index health: -1 means "not built yet in this process" (it is built
     // lazily by the first recall), otherwise the number of indexed documents.
     indexDocs: vault.index ? vault.index.docs.size : -1,
@@ -2728,6 +2742,9 @@ function formatStats(stats, key) {
     `  current project: ${key ?? "(none)"}`,
     `  memories: ${stats.total} total, ${stats.visible} visible here, ${stats.pinned} pinned (visible)`,
   ];
+  if (stats.projects?.length) {
+    lines.push(`  projects (visible): ${stats.projects.map((item) => `${item.project}=${item.count}`).join(", ")}`);
+  }
   if (stats.orphaned || stats.foreignLive || stats.legacyGlobal) {
     lines.push(
       `  stranded: ${stats.orphaned} recoverable orphan(s), ${stats.foreignLive} owned by another live project, ${stats.legacyGlobal} legacy global`,
@@ -3625,7 +3642,7 @@ let startupWarning = "";
 
       memory_stats: tool({
         description:
-          "Report the health and shape of the OpenMind store: path, encryption state, size, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, and a tag histogram. Use before a large recall or when memories seem missing - it distinguishes an empty store from a locked one from records stranded under another project path.",
+          "Report the health and shape of the OpenMind store: path, encryption state, size, entry counts (total, visible here, pinned, stranded), oldest/newest visible memory, a per-project breakdown of the visible memories, and a tag histogram. Use before a large recall or when memories seem missing - it distinguishes an empty store from a locked one from records stranded under another project path.",
         args: {
           tags: tool.schema.boolean().optional().describe("Include the tag histogram (default true)."),
         },
@@ -3665,6 +3682,7 @@ let startupWarning = "";
                   kdf: stats.kdf,
                   kdfUpgradePending: stats.kdfUpgradePending,
                   maxMemories: stats.maxMemories,
+                  projects: stats.projects,
                   indexDocs: stats.indexDocs,
                   indexTerms: stats.indexTerms,
                   indexLimited: stats.indexLimited,
@@ -4382,7 +4400,7 @@ async execute(args, context) {
         args: {},
         async execute() {
           return [
-            "OpenMind v7.2.0 — Quick help",
+            "OpenMind v7.3.0 — Quick help",
             "",
             "Tools:",
             "  memory_remember {text,tags,source,pinned,dedupe}  - save a project fact",

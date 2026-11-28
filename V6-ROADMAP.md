@@ -9,7 +9,7 @@ the current tree, i.e. none of these are caught by the existing suite.
 
 
 
-## Status (as of 7.2.0)
+## Status (as of 7.3.0)
 
 **Shipped in 6.0.0 — P0 #1, #2, #3, #4, #5 and #20.** All five correctness bugs are
 fixed and each one is pinned by a regression test, so a reintroduction is caught before release.
@@ -173,6 +173,10 @@ build.
 path now skips the write when an existing visible memory already carries the same
 content digest as the freshly built summary (P3 #19 tail), complementing the v7.0.0
 bounded per-URL cache with store-level content-hash dedupe.
+
+**Shipped in 7.3.0 — memory_stats project breakdown.** `memory_stats` now reports the
+per-project breakdown of the visible memories (`projects (visible): <project>=<count>`)
+alongside the existing counts and timestamps (P1 #8 tail).
 
 ---
 
@@ -463,5 +467,6 @@ each historical fixture and asserts the v6 result.
 | **v7.0 (features)** — shipped | listen_analyze URL cache (P3 #19) + agent scope (P1 #9) + stemmed near-dup merge | All three backlog features shipped and released as v7.0.0. |
 | **v7.0.1 (patch)** — shipped | CI node-24 + lockfile sync | Patch release: CI `Load check` green on Node 24, lockfile in sync with package.json. |
 | **v7.2 (content-hash dedupe)** — shipped | listen_analyze permanent-save digest skip (P3 #19) | Completes the listen caching story: cache hit skips save via savedId; fresh analyses dedupe by content digest. |
+| **v7.3 (stats breakdown)** — shipped | memory_stats per-project breakdown | Adds `projects (visible)` grouping to the stats output and metadata. |
 | **v6.3.3 (session identity)** — shipped | `useSessionProject` plugin option: session-scoped project key | Closes the last open project-identity gap: the instance project no longer silently wins over a deliberately moved session. |
 | **v6.4 (security + reach)** | P2 #14 Argon2id re-key, P2 #15 npm publish, #13 semantic recall | Argon2id is a cheap, high-value hardening; publishing makes the fixes usable by others. |
